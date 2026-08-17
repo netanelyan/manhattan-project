@@ -1,0 +1,384 @@
+<!doctype html>
+<!--
+  SPIKE: WebGL2 instanced-rectangle throughput for a chip layout viewer.
+
+  QUESTION
+    Can WebGL2 instanced rendering sustain 60fps while drawing millions of
+    axis-aligned rectangles, under pan and zoom, in a browser tab?
+
+  PASS  : 2M+ instances holding ~60fps (avg frame <= ~16.7ms) under the
+          5-second benchmark pan.
+  FAIL  : under 500k instances at 60fps -> instancing is the wrong
+          architecture; consider pre-rendered raster tiles instead.
+
+  Throwaway code. Synthetic data (seeded PRNG), integer nanometre coordinates,
+  standard-cell-like rows. No build step: open this file in a browser.
+  NOTE: at 20M instances this allocates ~1GB of CPU+GPU buffers.
+-->
+<html>
+<head>
+<meta charset="utf-8">
+<title>stress spike</title>
+<style>
+  html,body { margin:0; height:100%; background:#111; overflow:hidden; }
+  canvas { display:block; width:100vw; height:100vh; cursor:grab; }
+  #hud {
+    position:fixed; top:8px; left:8px; color:#9fd49f;
+    font:12px/1.5 Consolas, monospace; white-space:pre;
+    background:rgba(0,0,0,.55); padding:6px 10px; pointer-events:none;
+  }
+  #panel {
+    position:fixed; top:8px; right:8px; width:240px; color:#ccc;
+    font:12px/1.7 Consolas, monospace;
+    background:rgba(20,20,20,.9); padding:10px; border:1px solid #333;
+  }
+  #panel label { display:block; }
+  #panel button { display:block; width:100%; margin:4px 0; font:inherit; }
+  #panel input[type=range] { width:100%; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud"></div>
+<div id="panel">
+  <label>instances: <span id="countLabel"></span>
+    <input id="countSlider" type="range" min="0" max="1000" value="435">
+  </label>
+  <button id="benchBtn">benchmark (5s circular pan)</button>
+  <button id="fitBtn">fit to die</button>
+  <button id="deepBtn">zoom to 1e6</button>
+  <label><input id="fixChk" type="checkbox"> local origin fix</label>
+  <label><input id="cullChk" type="checkbox"> viewport culling</label>
+  <label><input id="minPxChk" type="checkbox"> skip subpixel cells</label>
+  <label>min px width: <span id="minPxLabel">1.0</span>
+    <input id="minPxSlider" type="range" min="0" max="4" step="0.25" value="1">
+  </label>
+</div>
+<script>
+"use strict";
+// ---------------------------------------------------------------- constants
+const ROW_H = 1000;          // nm, every cell in a row is this tall
+const MAX_W = 4000;          // nm, widest cell (used by cull binary search)
+const SEED  = 42;
+const PALETTE = [            // muted flat colors, one per cell type
+  [0.42,0.36,0.55],[0.30,0.48,0.42],[0.55,0.44,0.30],[0.33,0.41,0.55],
+  [0.52,0.33,0.36],[0.38,0.50,0.28],[0.30,0.46,0.52],[0.48,0.48,0.48],
+];
+
+// ---------------------------------------------------------------- data gen
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function() {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+let N = 0, xs, ys, ws, ts, rowStart, numRows, dieW, dieH, scratch, genMs;
+
+function generate(n) {
+  const t0 = performance.now();
+  N = n;
+  // roughly square die: total area = n * avgWidth(2200) * ROW_H
+  dieW = Math.max(4000, Math.round(Math.sqrt(n * 2200 * ROW_H) / 200) * 200);
+  xs = new Int32Array(n); ys = new Int32Array(n);
+  ws = new Int32Array(n); ts = new Uint8Array(n);
+  scratch = new Float32Array(n * 5);        // shared CPU-side staging buffer
+  const rand = mulberry32(SEED);
+  const starts = [];
+  let count = 0, row = 0;
+  while (count < n) {
+    starts.push(count);
+    let x = 0;
+    while (x < dieW && count < n) {
+      let w = 400 + 200 * ((rand() * 19) | 0);      // 400..4000, 200nm grid
+      if (x + w > dieW) w = dieW - x;               // butt against die edge
+      xs[count] = x; ys[count] = row * ROW_H;
+      ws[count] = w; ts[count] = (rand() * 8) | 0;
+      x += w; count++;
+    }
+    row++;
+  }
+  numRows = row;
+  dieH = numRows * ROW_H;
+  rowStart = new Int32Array(numRows + 1);
+  for (let i = 0; i < numRows; i++) rowStart[i] = starts[i];
+  rowStart[numRows] = n;
+  genMs = performance.now() - t0;
+  needFullUpload = true;
+}
+
+// ---------------------------------------------------------------- webgl
+const canvas = document.getElementById("c");
+const gl = canvas.getContext("webgl2", { antialias: false });
+if (!gl) document.body.textContent = "WebGL2 not available";
+
+const VS = `#version 300 es
+layout(location=0) in vec2 a_corner;
+layout(location=1) in vec2 a_pos;
+layout(location=2) in float a_w;
+layout(location=3) in float a_h;
+layout(location=4) in float a_type;
+uniform vec2  u_cam;    // camera center minus origin, world nm
+uniform float u_scale;  // device px per nm
+uniform vec2  u_res;    // device px
+uniform float u_minPx;  // collapse instances narrower than this on screen
+flat out int v_type;
+void main() {
+  if (a_w * u_scale < u_minPx) { gl_Position = vec4(0.,0.,0.,-1.); return; }
+  vec2 world = a_pos + a_corner * vec2(a_w, a_h);
+  vec2 px = (world - u_cam) * u_scale + 0.5 * u_res;
+  gl_Position = vec4(px.x/u_res.x*2.0-1.0, 1.0-px.y/u_res.y*2.0, 0.0, 1.0);
+  v_type = int(a_type + 0.5);
+}`;
+const FS = `#version 300 es
+precision mediump float;
+flat in int v_type;
+uniform vec3 u_palette[8];
+out vec4 o;
+void main() { o = vec4(u_palette[v_type], 1.0); }`;
+
+function shader(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+    throw gl.getShaderInfoLog(s);
+  return s;
+}
+const prog = gl.createProgram();
+gl.attachShader(prog, shader(gl.VERTEX_SHADER, VS));
+gl.attachShader(prog, shader(gl.FRAGMENT_SHADER, FS));
+gl.linkProgram(prog);
+if (!gl.getProgramParameter(prog, gl.LINK_STATUS))
+  throw gl.getProgramInfoLog(prog);
+gl.useProgram(prog);
+const U = {};
+for (const n of ["u_cam","u_scale","u_res","u_minPx","u_palette"])
+  U[n] = gl.getUniformLocation(prog, n);
+gl.uniform3fv(U.u_palette, PALETTE.flat());
+gl.clearColor(0.07, 0.07, 0.07, 1);
+
+const vao = gl.createVertexArray();
+gl.bindVertexArray(vao);
+const quadBuf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0,0, 1,0, 0,1, 1,1]), gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0);
+gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+const instBuf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, instBuf);
+// interleaved per instance: x, y, w, h, type (5 floats, 20 bytes)
+gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 2, gl.FLOAT, false, 20, 0);  gl.vertexAttribDivisor(1, 1);
+gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2, 1, gl.FLOAT, false, 20, 8);  gl.vertexAttribDivisor(2, 1);
+gl.enableVertexAttribArray(3); gl.vertexAttribPointer(3, 1, gl.FLOAT, false, 20, 12); gl.vertexAttribDivisor(3, 1);
+gl.enableVertexAttribArray(4); gl.vertexAttribPointer(4, 1, gl.FLOAT, false, 20, 16); gl.vertexAttribDivisor(4, 1);
+
+// ---------------------------------------------------------------- camera
+const cam = { x: 0, y: 0, scale: 1 };   // f64 on CPU; scale = device px / nm
+const origin = { x: 0, y: 0 };          // subtracted from coords when fix ON
+let fitScale = 1;
+let dpr = 1, resW = 0, resH = 0;
+
+function resize() {
+  dpr = window.devicePixelRatio || 1;
+  resW = Math.round(canvas.clientWidth * dpr);
+  resH = Math.round(canvas.clientHeight * dpr);
+  if (canvas.width !== resW || canvas.height !== resH) {
+    canvas.width = resW; canvas.height = resH;
+    gl.viewport(0, 0, resW, resH);
+  }
+}
+window.addEventListener("resize", resize);
+
+function fitToDie() {
+  resize();
+  fitScale = Math.min(resW / dieW, resH / dieH) * 0.95;
+  cam.scale = fitScale;
+  cam.x = dieW / 2; cam.y = dieH / 2;
+}
+function zoomDeep() {
+  fitToDie();
+  cam.scale = fitScale * 1e6;
+  cam.x = dieW * 0.5 + 123457;   // land mid-die on a non-round coordinate
+  cam.y = dieH * 0.5 + 7653;
+}
+
+// ---------------------------------------------------------------- input
+let dragging = false, lastX = 0, lastY = 0;
+canvas.addEventListener("mousedown", e => { dragging = true; lastX = e.clientX; lastY = e.clientY; });
+window.addEventListener("mouseup", () => dragging = false);
+window.addEventListener("mousemove", e => {
+  if (!dragging || benchActive) return;
+  cam.x -= (e.clientX - lastX) * dpr / cam.scale;
+  cam.y -= (e.clientY - lastY) * dpr / cam.scale;
+  lastX = e.clientX; lastY = e.clientY;
+});
+canvas.addEventListener("wheel", e => {
+  e.preventDefault();
+  if (benchActive) return;
+  const px = e.clientX * dpr, py = e.clientY * dpr;
+  const wx = cam.x + (px - resW / 2) / cam.scale;   // world point under cursor
+  const wy = cam.y + (py - resH / 2) / cam.scale;
+  cam.scale *= Math.exp(-e.deltaY * 0.0015);
+  cam.x = wx - (px - resW / 2) / cam.scale;         // keep it under cursor
+  cam.y = wy - (py - resH / 2) / cam.scale;
+}, { passive: false });
+
+// ---------------------------------------------------------------- controls
+const $ = id => document.getElementById(id);
+const countSlider = $("countSlider"), countLabel = $("countLabel");
+const fixChk = $("fixChk"), cullChk = $("cullChk");
+const minPxChk = $("minPxChk"), minPxSlider = $("minPxSlider"), minPxLabel = $("minPxLabel");
+
+function sliderToCount(v) {   // log scale 100k .. 20M
+  return Math.round(1e5 * Math.pow(200, v / 1000));
+}
+function fmt(n) { return n.toLocaleString("en-US"); }
+countLabel.textContent = fmt(sliderToCount(+countSlider.value));
+countSlider.addEventListener("input", () => countLabel.textContent = fmt(sliderToCount(+countSlider.value)));
+countSlider.addEventListener("change", () => { generate(sliderToCount(+countSlider.value)); fitToDie(); });
+fixChk.addEventListener("change", () => { needFullUpload = true; });
+cullChk.addEventListener("change", () => { needFullUpload = true; });
+minPxSlider.addEventListener("input", () => minPxLabel.textContent = (+minPxSlider.value).toFixed(2));
+$("fitBtn").addEventListener("click", fitToDie);
+$("deepBtn").addEventListener("click", zoomDeep);
+$("benchBtn").addEventListener("click", startBench);
+
+// ---------------------------------------------------------------- buffers
+let needFullUpload = true;
+let drawnCount = 0;
+
+function updateOrigin() {
+  if (!fixChk.checked) {
+    if (origin.x !== 0 || origin.y !== 0) { origin.x = 0; origin.y = 0; needFullUpload = true; }
+    return;
+  }
+  // resnap when the camera has drifted ~1e6 px worth of world distance from
+  // the origin, so the numbers fed to f32 stay small at any zoom
+  const drift = Math.max(Math.abs(cam.x - origin.x), Math.abs(cam.y - origin.y)) * cam.scale;
+  if (drift > 1e6 || (origin.x === 0 && origin.y === 0)) {
+    origin.x = cam.x; origin.y = cam.y;
+    needFullUpload = true;
+  }
+}
+
+function uploadAll() {          // culling OFF: every instance, one static upload
+  const ox = origin.x, oy = origin.y;
+  for (let i = 0, k = 0; i < N; i++) {
+    scratch[k++] = xs[i] - ox; scratch[k++] = ys[i] - oy;
+    scratch[k++] = ws[i]; scratch[k++] = ROW_H; scratch[k++] = ts[i];
+  }
+  gl.bindBuffer(gl.ARRAY_BUFFER, instBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, scratch.subarray(0, N * 5), gl.DYNAMIC_DRAW);
+  drawnCount = N;
+}
+
+function uploadCulled(minPx) {  // culling ON: rebuild visible subset each frame
+  const ox = origin.x, oy = origin.y;
+  const halfW = resW / 2 / cam.scale, halfH = resH / 2 / cam.scale;
+  const left = cam.x - halfW, right = cam.x + halfW;
+  const top = cam.y - halfH, bot = cam.y + halfH;
+  const r0 = Math.max(0, Math.floor(top / ROW_H));
+  const r1 = Math.min(numRows - 1, Math.floor(bot / ROW_H));
+  const minW = minPx > 0 ? minPx / cam.scale : 0;
+  let k = 0;
+  for (let r = r0; r <= r1; r++) {
+    // rows are generated left-to-right, so xs is sorted within a row:
+    // binary search the first cell that could overlap the left edge
+    let lo = rowStart[r], hi = rowStart[r + 1];
+    const target = left - MAX_W;
+    while (lo < hi) { const mid = (lo + hi) >> 1; if (xs[mid] < target) lo = mid + 1; else hi = mid; }
+    for (let i = lo, end = rowStart[r + 1]; i < end && xs[i] < right; i++) {
+      const w = ws[i];
+      if (xs[i] + w <= left || w < minW) continue;
+      scratch[k++] = xs[i] - ox; scratch[k++] = ys[i] - oy;
+      scratch[k++] = w; scratch[k++] = ROW_H; scratch[k++] = ts[i];
+    }
+  }
+  gl.bindBuffer(gl.ARRAY_BUFFER, instBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, scratch.subarray(0, k), gl.DYNAMIC_DRAW);
+  drawnCount = k / 5;
+}
+
+// ---------------------------------------------------------------- benchmark
+let benchActive = false, benchT0 = 0, benchSamples = [], benchBase = null, benchR = 0;
+let benchResult = "benchmark: (not run)";
+function startBench() {
+  if (benchActive) return;
+  benchBase = { x: cam.x, y: cam.y, scale: cam.scale };
+  benchR = (resW / cam.scale) * 0.25;      // circle radius: 25% of view width
+  benchSamples = [];
+  benchT0 = 0;
+  benchActive = true;
+}
+
+// ---------------------------------------------------------------- loop
+const dts = [];                             // rolling frame times (last 60)
+let lastT = 0;
+const hud = document.getElementById("hud");
+
+function frame(t) {
+  resize();
+  const dt = lastT ? t - lastT : 16.7;
+  lastT = t;
+  dts.push(dt); if (dts.length > 60) dts.shift();
+
+  if (benchActive) {
+    if (!benchT0) benchT0 = t;
+    const el = t - benchT0;
+    if (el >= 5000) {
+      benchActive = false;
+      cam.x = benchBase.x; cam.y = benchBase.y; cam.scale = benchBase.scale;
+      const s = benchSamples;
+      if (s.length > 2) {
+        const body = s.slice(1);            // drop first (includes setup jank)
+        const min = Math.min(...body), max = Math.max(...body);
+        const avg = body.reduce((a, b) => a + b, 0) / body.length;
+        benchResult = `benchmark: min ${min.toFixed(2)} / avg ${avg.toFixed(2)} / max ${max.toFixed(2)} ms  (${(1000/avg).toFixed(1)} fps avg, ${body.length} frames)`;
+      }
+    } else {
+      benchSamples.push(dt);
+      const a = (el / 5000) * Math.PI * 4;  // two loops in 5s
+      cam.x = benchBase.x + benchR * (Math.cos(a) - 1);
+      cam.y = benchBase.y + benchR * Math.sin(a);
+    }
+  }
+
+  updateOrigin();
+  const minPx = minPxChk.checked ? +minPxSlider.value : 0;
+
+  if (cullChk.checked) {
+    uploadCulled(minPx);                    // CPU skip: real drawn count
+  } else if (needFullUpload) {
+    uploadAll();                            // static; shader handles minPx
+  }
+  needFullUpload = false;
+
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.uniform2f(U.u_cam, cam.x - origin.x, cam.y - origin.y);
+  gl.uniform1f(U.u_scale, cam.scale);
+  gl.uniform2f(U.u_res, resW, resH);
+  gl.uniform1f(U.u_minPx, cullChk.checked ? 0 : minPx);
+  if (drawnCount > 0) gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, drawnCount);
+
+  const avg = dts.reduce((a, b) => a + b, 0) / dts.length;
+  hud.textContent =
+    `instances : ${fmt(N)}  (gen ${genMs.toFixed(0)}ms, die ${(dieW/1e6).toFixed(2)} x ${(dieH/1e6).toFixed(2)} Mnm)\n` +
+    `drawn     : ${fmt(drawnCount)}${cullChk.checked ? `  culled/skipped: ${fmt(N - drawnCount)} (${(100*(N-drawnCount)/N).toFixed(1)}%)` : "  (culling off)"}\n` +
+    `frame     : ${avg.toFixed(2)} ms  |  fps(60-frame avg): ${(1000/avg).toFixed(1)}\n` +
+    `zoom      : ${cam.scale.toExponential(2)} px/nm  (${(cam.scale/fitScale).toExponential(1)}x fit)\n` +
+    `origin fix: ${fixChk.checked ? "ON" : "OFF"}   culling: ${cullChk.checked ? "ON" : "OFF"}   minPx: ${minPx}\n` +
+    benchResult + (benchActive ? "  [running...]" : "");
+
+  requestAnimationFrame(frame);
+}
+
+// ---------------------------------------------------------------- go
+generate(sliderToCount(+countSlider.value));
+fitToDie();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
