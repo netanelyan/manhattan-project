@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Manhattan viewer</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0e0e10; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; cursor: grab; }
+  #hud {
+    position: fixed; top: 10px; left: 10px;
+    color: #9fd49f; font: 12px/1.55 Consolas, "DejaVu Sans Mono", monospace;
+    white-space: pre; pointer-events: none;
+    background: rgba(0, 0, 0, .58); padding: 8px 12px; border: 1px solid #24301f;
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud">loading...</div>
+<script type="module" src="./main.js"></script>
+</body>
+</html>
