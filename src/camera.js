@@ -40,17 +40,26 @@ export class Camera {
 }
 
 // Wire mouse pan and wheel zoom onto a canvas. Returns nothing; mutates cam.
-export function attachControls(canvas, cam, onChange = () => {}) {
-  let dragging = false, lastX = 0, lastY = 0;
+// A click is a mouseup that did not travel: panning and picking share a button,
+// so the only thing separating them is how far the pointer moved. Four device
+// pixels is enough to survive a shaky hand and small enough that a deliberate
+// drag is never mistaken for a click.
+const CLICK_SLOP = 4;
+
+export function attachControls(canvas, cam, onChange = () => {}, onClick = () => {}) {
+  let dragging = false, lastX = 0, lastY = 0, downX = 0, downY = 0, travel = 0;
   canvas.addEventListener('mousedown', e => {
     dragging = true; lastX = e.clientX; lastY = e.clientY;
+    downX = e.clientX; downY = e.clientY; travel = 0;
     canvas.style.cursor = 'grabbing';
   });
-  window.addEventListener('mouseup', () => {
+  window.addEventListener('mouseup', e => {
+    if (dragging && travel <= CLICK_SLOP) onClick(downX * cam.dpr, downY * cam.dpr, e);
     dragging = false; canvas.style.cursor = 'grab';
   });
   window.addEventListener('mousemove', e => {
     if (!dragging) return;
+    travel += Math.abs(e.clientX - lastX) + Math.abs(e.clientY - lastY);
     cam.panPixels((e.clientX - lastX) * cam.dpr, (e.clientY - lastY) * cam.dpr);
     lastX = e.clientX; lastY = e.clientY;
     onChange();

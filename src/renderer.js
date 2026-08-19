@@ -311,7 +311,8 @@ out vec4 o_color;
 void main() {
   o_color = v_kind == 0 ? vec4(0.25, 0.85, 0.95, 1.0)
           : v_kind == 1 ? vec4(0.95, 0.55, 0.20, 1.0)
-                        : vec4(0.55, 0.60, 0.70, 1.0);   // block instance outline
+          : v_kind == 2 ? vec4(0.55, 0.60, 0.70, 1.0)    // block instance outline
+                        : vec4(1.00, 0.95, 0.35, 1.0);   // selection
 }`;
 
 function compile(gl, type, src) {
@@ -414,6 +415,9 @@ export class Renderer {
     this.densityRange = [0, 1];
     this.blockSize = 0;
     this.blockBounds = false;
+    // What was clicked, as a chip-space rect. A panel that describes a cell
+    // without showing which one it is leaves the reader counting rows.
+    this.selectionBox = null;
     this.colorMode = 0;
     this.showTiles = false;
     this.minPx = 0;
@@ -726,6 +730,7 @@ export class Renderer {
       calls += this._drawSet(setup, this.layerMask);
     }
 
+    if (this.selectionBox) calls += this._drawSelection(cam, camX, camY);
     if (this.blockBounds && this.instances.length > 1) calls += this._drawBlockBounds(cam, camX, camY);
     if (this.showTiles) calls += this._drawTileBounds(cam, camX, camY);
 
@@ -788,6 +793,24 @@ export class Renderer {
       });
     }
     return calls;
+  }
+
+  // The selected placement or density block, as one line loop.
+  _drawSelection(cam, camX, camY) {
+    const gl = this.gl;
+    const s = this.selectionBox;
+    const data = new Float32Array([
+      s.x - this.originX, s.y - this.originY, s.w, s.h, 3,
+    ]);
+    gl.bindVertexArray(this.lineVao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.lineBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, data, gl.DYNAMIC_DRAW);
+    gl.useProgram(this.lines.prog);
+    gl.uniform2f(this.lines.U.u_cam, camX, camY);
+    gl.uniform1f(this.lines.U.u_scale, cam.scale);
+    gl.uniform2f(this.lines.U.u_res, cam.resW, cam.resH);
+    gl.drawArraysInstanced(gl.LINE_LOOP, 0, 4, 1);
+    return 1;
   }
 
   // Block instance outlines. At chip zoom the blocks are the structure - where

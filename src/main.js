@@ -20,15 +20,20 @@ import { Renderer, LAYER_NAMES, TOGGLE_LAYERS, CLASS_LAYER_NAMES } from './rende
 import { TileStore, PRIORITY } from './tiles.js';
 import { deriveLadder, LevelPicker, viewOf } from './lod.js';
 import { Chip, singleInstance, rectToBlock } from './chip.js';
+import { pick, KLASS_NAME, ORIENT_NAME } from './pick.js';
 
 const params = new URLSearchParams(location.search);
 const DATA = params.get('data') || '../data';
 const CACHE_MB = +(params.get('cache') || 64);
 let maxVisibleTiles = +(params.get('maxtiles') || 128);   // manifest default applied at boot
 const PREFETCH_RING = +(params.get('ring') ?? 1);
+const JUMP_CELL_PX = 10;      // arriving at a coordinate should show geometry, not a region
 
 const canvas = document.getElementById('c');
 const hud = document.getElementById('hud');
+const panel = document.getElementById('panel');
+const bar = document.getElementById('bar');
+const jumpInput = document.getElementById('jump');
 const gl = canvas.getContext('webgl2', { antialias: false, depth: true });
 if (!gl) {
   document.body.innerHTML = '<p style="color:#c66;font:14px monospace;padding:2em">WebGL2 not available.</p>';
@@ -289,6 +294,11 @@ async function boot() {
   refresh();
   await store.settle();      // only so scripted runs are deterministic
   apply();
+  if (params.has('pick')) {
+    const [px, py] = params.get('pick').split(',').map(Number);
+    if (Number.isFinite(px) && Number.isFinite(py)) identifyAt(px, py);
+  }
+  writeUrl();
   status = `ready in ${(performance.now() - t0).toFixed(0)}ms`;
 
   const nPan = +(params.get('pan') || 0);
@@ -458,14 +468,194 @@ function report(msg) {
   if (!(navigator.sendBeacon && navigator.sendBeacon(url))) fetch(url).catch(() => {});
 }
 
+// ---------------------------------------------------------------- identify
+//
+// The click resolves through the same transform and the same tile arithmetic
+// the culling path uses; see src/pick.js. What comes back is what the format
+// actually carries, which is not everything a person would want - there are no
+// names in masters.bin or in a placement record, so a master is its index and a
+// placement is its coordinates. Saying so beats inventing an identifier.
+let selection = null;
+
+let pickPoint = null;
+
+function identify(px, py) {
+  if (!renderer || !manifest) return;
+  identifyAt(cam.x + (px - cam.resW / 2) / cam.scale,
+             cam.y + (py - cam.resH / 2) / cam.scale);
+}
+
+function identifyAt(cx, cy) {
+  selection = pick(cx, cy, { chip, store, level: levelOf(useZ), masters: renderer.masters });
+  pickPoint = selection ? [cx, cy] : null;
+  // The hit, in chip space. Every orientation is axis-preserving, so the two
+  // transformed corners are the rect - no rotated outline to draw.
+  if (selection) {
+    const T = selection.inst.T;
+    const ax = T.toChipX(selection.x, selection.y), ay = T.toChipY(selection.x, selection.y);
+    const bx = T.toChipX(selection.x + selection.w, selection.y + selection.h);
+    const by = T.toChipY(selection.x + selection.w, selection.y + selection.h);
+    renderer.selectionBox = {
+      x: Math.min(ax, bx), y: Math.min(ay, by),
+      w: Math.abs(bx - ax), h: Math.abs(by - ay),
+    };
+  } else {
+    renderer.selectionBox = null;
+  }
+  drawPanel(cx, cy);
+  syncUrl();
+}
+
+const nm = v => `${fmt(Math.round(v))} nm`;
+const um = v => `${(v / 1000).toFixed(2)} um`;
+
+function drawPanel(cx, cy) {
+  const s = selection;
+  if (!s) {
+    panel.textContent = `nothing at ${nm(cx)}, ${nm(cy)}   (level z${useZ} ${levelOf(useZ).kind})`;
+    panel.classList.add('on');
+    return;
+  }
+  const inst = s.inst;
+  const where = `block instance ${inst.i} / ${chip.count}  ${ORIENT_NAME[inst.orient]} at ${nm(inst.x)}, ${nm(inst.y)}`;
+
+  if (s.kind === 'placement') {
+    panel.textContent =
+`placement    master #${s.master}  ${KLASS_NAME[s.klass] || '?'}   ${um(s.w)} x ${um(s.h)}   orient ${ORIENT_NAME[s.orient]}
+             block  ${nm(s.x)}, ${nm(s.y)}      chip  ${nm(inst.T.toChipX(s.x, s.y))}, ${nm(inst.T.toChipY(s.x, s.y))}
+             ${where}
+             tile   z${s.z} ${s.tx}/${s.ty}   placement ${fmt(s.index)} / ${fmt(s.tile.count)}${s.tile.isOverflow ? ' (overflow list)' : ''}${s.overlaps ? `   +${s.overlaps} overlapping` : ''}
+             no names in the format: #${s.master} is the master's index in masters.bin, and the placement's identity is its position`;
+  } else {
+    const occ = s.density + s.fill;
+    panel.textContent =
+`density      logic ${(100 * s.density).toFixed(1)}%   filler ${(100 * s.fill).toFixed(1)}%   ` +
+`${occ > 1e-4 ? `dead ${(100 * s.fill / occ).toFixed(0)}% of what is occupied` : 'empty'}
+             block  ${um(s.w)} x ${um(s.h)} at ${nm(s.x)}, ${nm(s.y)} in the block
+             ${where}
+             tile   z${s.z} ${s.tx}/${s.ty}   block ${fmt(s.index)} / ${fmt(s.tile.count)}
+             a far level holds no placements - this is merged density, not a cell`;
+  }
+  panel.classList.add('on');
+}
+
+function clearPanel() {
+  selection = null;
+  pickPoint = null;
+  if (renderer) renderer.selectionBox = null;
+  panel.classList.remove('on');
+  syncUrl();
+}
+
+// ---------------------------------------------------------------- jump to
+//
+// What the workflow actually needs: a tool says "violation at (482100, 918400)"
+// and the answer has to be one paste away. Chip coordinates, because that is
+// what a chip-level tool reports; the block instance is resolved rather than
+// asked for.
+function openJump() {
+  bar.classList.add('on');
+  jumpInput.value = '';
+  jumpInput.focus();
+}
+function closeJump() { bar.classList.remove('on'); jumpInput.blur(); }
+
+// Accepts what a tool or a person actually produces: "482100, 918400",
+// "482100 918400", "(482100,918400)", "x=482100 y=918400", and the
+// comma-grouped form the panel itself prints, "482,100, 918,400".
+//
+// A comma counts as a thousands separator only when it is followed by exactly
+// three digits and then something that is not a digit - which is what tells
+// "482,100" apart from "482100,918400". Anything that leaves other than two
+// numbers is refused rather than guessed at: silently reading "4 100 000" as
+// y = 4 would send someone to the wrong place and look like it worked.
+export function parseCoordinate(text) {
+  const cleaned = String(text).replace(/,(?=\d{3}(\D|$))/g, '').replace(/_/g, '');
+  const found = cleaned.match(/-?\d+(\.\d+)?/g) || [];
+  if (found.length !== 2) return { error: `expected two numbers, found ${found.length}` };
+  const x = +found[0], y = +found[1];
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return { error: 'not a coordinate' };
+  return { x, y };
+}
+
+function jumpTo(text) {
+  const parsed = parseCoordinate(text);
+  if (parsed.error) {
+    status = `"${text}": ${parsed.error} - give x and y in nm`;
+    return;
+  }
+  const { x, y } = parsed;
+
+  cam.x = x; cam.y = y;
+  // Zoom in if the view is coarser than this, but never zoom out: arriving at a
+  // reported coordinate should show geometry, and someone already deep in a
+  // block does not want to be pulled back out.
+  const want = JUMP_CELL_PX / (manifest.meanCellWidth || 700);
+  if (cam.scale < want) cam.scale = want;
+
+  const hit = chip.visible({ minX: x, minY: y, maxX: x, maxY: y })[0];
+  status = hit
+    ? `jumped to ${nm(x)}, ${nm(y)} - block instance ${hit.i} of ${chip.count}`
+    : `jumped to ${nm(x)}, ${nm(y)} - outside every block instance`;
+  closeJump();
+  refresh();
+  syncUrl();
+}
+
+// ---------------------------------------------------------------- shareable url
+//
+// The one thing a desktop layout viewer structurally cannot do: hand someone
+// else exactly what is on your screen. The parameters are the same ones the
+// loader has always accepted, so the URL is symmetric - what it writes, it can
+// read back.
+//
+// replaceState on a trailing throttle, never pushState: a pan is not a
+// navigation, and the back button should leave the page rather than walk
+// backwards through every frame of it.
+const URL_THROTTLE_MS = 350;
+let urlTimer = 0;
+
+function syncUrl() {
+  if (urlTimer) return;
+  urlTimer = setTimeout(() => { urlTimer = 0; writeUrl(); }, URL_THROTTLE_MS);
+}
+
+function writeUrl() {
+  if (!renderer || !manifest) return;
+  const p = new URLSearchParams(location.search);
+  // One-shot commands, not view state: a shared link should not re-run a
+  // benchmark on the person who opens it.
+  for (const k of ['pan', 'fling', 'sweep']) p.delete(k);
+
+  p.set('view', `${Math.round(cam.x)},${Math.round(cam.y)},${cam.scale.toPrecision(6)}`);
+  if (auto) { p.delete('z'); p.delete('auto'); } else { p.set('z', String(useZ)); p.set('auto', '0'); }
+
+  // With solo on, the mask IS the solo bit; what is worth restoring is the mask
+  // the solo was entered from, so that leaving solo returns somewhere useful.
+  const mask = soloLayer >= 0 ? maskBeforeSolo : renderer.layerMask;
+  if (mask === 0xffff) p.delete('mask'); else p.set('mask', '0x' + (mask >>> 0).toString(16));
+  if (soloLayer >= 0) p.set('solo', String(soloLayer)); else p.delete('solo');
+  if (renderer.colorMode) p.set('color', '1'); else p.delete('color');
+  if (renderer.translucent) p.set('alpha', '1'); else p.delete('alpha');
+  if (pickPoint) p.set('pick', `${Math.round(pickPoint[0])},${Math.round(pickPoint[1])}`);
+  else p.delete('pick');
+
+  // Hand-built rather than p.toString(), which percent-encodes the commas in
+  // view= and turns a readable link into a wall of %2C.
+  const safe = v => (/^[\w.,:+\-/]*$/.test(v) ? v : encodeURIComponent(v));
+  const q = [...p.entries()].map(([k, v]) => `${k}=${safe(v)}`).join('&');
+  history.replaceState(null, '', location.pathname + (q ? '?' + q : ''));
+}
+
 let refreshQueued = false;
 function onCameraChange() {
   if (refreshQueued) return;
   refreshQueued = true;
   queueMicrotask(() => { refreshQueued = false; refresh(); });
+  syncUrl();
 }
 
-attachControls(canvas, cam, onCameraChange);
+attachControls(canvas, cam, onCameraChange, identify);
 window.addEventListener('resize', () => { resize(); onCameraChange(); });
 // Alpha for the translucent path. Everything a process engineer wants to see
 // through is routing: metal over via over metal. The lower layers stay nearly
@@ -497,6 +687,15 @@ function solo(R, layer) {
 window.addEventListener('keydown', e => {
   if (!renderer) return;
   const R = renderer;
+  // While the jump box has focus it owns the keyboard; layer keys would
+  // otherwise fire on every digit typed into a coordinate.
+  if (e.target === jumpInput) {
+    if (e.key === 'Enter') jumpTo(jumpInput.value);
+    else if (e.key === 'Escape') closeJump();
+    return;
+  }
+  if (e.key === 'Escape') { closeJump(); clearPanel(); return; }
+  if (e.key === 'g') { e.preventDefault(); openJump(); return; }
   // e.code, not e.key: shift turns '1' into '!' and the layer keys have to keep
   // working with it held.
   const digit = /^Digit([1-9])$/.exec(e.code);
@@ -504,6 +703,7 @@ window.addEventListener('keydown', e => {
     const layer = TOGGLE_LAYERS[+digit[1] - 1];
     if (e.shiftKey) solo(R, layer);
     else { R.layerMask ^= 1 << layer; soloLayer = -1; }
+    syncUrl();
     return;
   }
   switch (e.key) {
@@ -521,6 +721,7 @@ window.addEventListener('keydown', e => {
     case 'l': auto = !auto; picker.seed(useZ); refresh(); break;
     case 'f': cam.fit(0, 0, chip.w, chip.h); refresh(); break;
   }
+  syncUrl();
 });
 
 // ---------------------------------------------------------------- loop
@@ -588,7 +789,8 @@ memory     masters ${mb(R.masters.bytes)} MB   gpu slots ${mb(R.poolBytes)} MB
 zoom       ${cam.scale.toExponential(2)} px/nm   ${nmPerPx < 1 ? (nmPerPx * 1000).toFixed(1) + ' pm/px' : nmPerPx.toFixed(1) + ' nm/px'}   origin ${R.originX.toFixed(0)},${R.originY.toFixed(0)}
 layers     ${layerLine(R)}   ${soloLayer >= 0 ? `SOLO ${LAYER_NAMES[soloLayer]}` : '(+ visible, - hidden)'}
 color      ${R.colorMode ? `by class: ${CLASS_LAYER_NAMES.join(' / ')}` : 'by layer'}   ${R.translucent ? 'translucent (layer passes)' : 'opaque'}   density ${(100 * R.densityRange[0]).toFixed(0)}-${(100 * R.densityRange[1]).toFixed(0)}%   tiles ${R.showTiles ? 'on' : 'off'}   blocks ${R.blockBounds ? 'on' : 'off'}   minPx ${R.minPx.toFixed(1)}   ring ${PREFETCH_RING}
-keys       drag pan, wheel zoom, l auto/manual level, [ ] level by hand, f fit, 1-9 layer, shift+1-9 solo, a all, c colour, v translucent, b blocks, t tiles, p subpixel, r reset, -/= cache
+keys       drag pan, wheel zoom, click identify, g go to x,y, esc dismiss, l auto/manual level, [ ] by hand, f fit
+           1-9 layer, shift+1-9 solo, a all, c colour, v translucent, b blocks, t tiles, p subpixel, r reset, -/= cache
 ${status}`;
 }
 

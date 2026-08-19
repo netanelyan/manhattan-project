@@ -44,6 +44,12 @@ export class TileStore {
 
   has(k) { return this.cache.has(k); }
 
+  // Look without touching. Hit testing walks a handful of tiles per click and
+  // has no business promoting them in the LRU or counting as cache hits - the
+  // eviction order should reflect what is being drawn, not what was clicked
+  // near.
+  peek(k) { return this.cache.get(k); }
+
   // Cache hit; refreshes LRU position.
   get(k) {
     const t = this.cache.get(k);

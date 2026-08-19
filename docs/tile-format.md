@@ -923,6 +923,57 @@ Two things the sweep shows that the ladder alone does not:
 
 ---
 
+## Identity, and what the format cannot answer
+
+Clicking a placement resolves through the same transform and the same tile
+arithmetic the culling path uses - chip point to block point through the
+instance transform, block point to tile, then a scan of the tile. No index is
+built: a tile *is* a spatial index, it holds a few thousand placements, and a
+parallel structure would have to be maintained per level and kept in step with
+eviction to answer nothing new. The scan widens by two things that are cheap to
+include: neighbouring tiles within the level's content bleed, and the level's
+overflow list, which is where the macros are.
+
+What comes back is everything the format carries about a placement:
+
+| answered | from |
+|---|---|
+| master index, class, width, height | `masters.bin`, via the placement's master id |
+| orientation | the placement record's packed word |
+| position, in block and in chip nanometres | the record, and the instance transform |
+| which block instance, and where it sits | `chip.json` |
+| which tile, and which placement within it | the tile the scan found it in |
+
+**There are no names.** A placement is `(x, y, master | orient << 16)` and a
+master record is `(rectStart, rectCount, w, h, klass, rowH)` - twelve bytes and
+thirty-two bytes with nowhere for a string in either. So the viewer reports a
+master as `#1149` and says so in the panel rather than inventing `DFFQX1_A`,
+and there is no search box, because searching for names the format does not
+carry would be a feature that only works on synthetic data.
+
+Identity in practice is position: two cells cannot occupy the same origin, so
+`(block instance, x, y)` names a placement exactly, and that is what a shared
+link carries.
+
+### What names would cost
+
+Worth writing down, because the answer is not symmetric:
+
+- **Master names are nearly free.** A `names.bin` of concatenated UTF-8 with a
+  `u32` offset per master is about 60 KB for a 4,634-master library, fetched
+  once beside `masters.bin` and resident forever. This is the one to do first:
+  it turns `#1149` into a cell type, which is most of what a person wants.
+- **Instance names are the expensive one.** A name per placement means either a
+  `u32` offset in every placement record - 12 bytes to 16, **+33% on every deep
+  and mid tile**, on the format's largest files - or a side file per tile that
+  the viewer fetches only when something is clicked. The side file is the better
+  trade: identification is interactive and rare, streaming is not.
+
+Neither is implemented, and the second should not be until a real DEF says how
+long the names are.
+
+---
+
 ## Layers
 
 A layout is a stack, and drawn flat and opaque the upper layers hide what is
@@ -1174,6 +1225,10 @@ per-level quantum in the contract, so it is not done.
 | block instances, chip level | done — `chip.json`, fetched once and drawn N times |
 | several distinct blocks in one chip | in the format, not in the viewer |
 | density representation, logic and filler channels | done |
+| click to identify | done - reuses tiles as the spatial index |
+| jump to coordinate | done - chip coordinates, block instance resolved |
+| shareable view URL | done - position, scale, level, layers, colour, solo, selection |
+| instance and master names | not in the format, see Identity |
 | layer visibility, solo, per-layer alpha | done — alpha via ordered per-layer passes |
 | colour by cell class | done — cell / macro / power / filler |
 | combinational vs sequential class | not in the data model, see Layers |

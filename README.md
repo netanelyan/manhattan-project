@@ -61,6 +61,9 @@ Viewer keys:
 | `a` | all layers on / off |
 | `c` | colour by layer or by cell class |
 | `t` | tile bounds and content boxes overlay |
+| click | identify what is under the cursor |
+| `g` | go to an `x, y` coordinate in nm |
+| `esc` | dismiss the panel or the coordinate box |
 | `shift`+`1`-`9` | solo a layer, hide the rest |
 | `v` | per-layer alpha, see through the stack |
 | `b` | block instance outlines |
@@ -84,6 +87,25 @@ one pyramid. The default synthetic chip places the generated block 70 times -
 349 million placements at chip level, in the 117 MB the block already cost,
 against ~8.2 GB flattened. At the full-chip view that is **one tile fetched and
 70 draws**: the instancing the renderer already does for masters, one level up.
+
+## Sharing a view
+
+The URL is the view. It updates as you navigate - `replaceState` on a throttle,
+so the back button leaves the page instead of walking backwards through every
+pan - and loading it restores exactly what was on screen:
+
+| parameter | |
+|---|---|
+| `view=x,y,scale` | camera centre in nm, and device pixels per nm |
+| `z=N&auto=0` | a level held by hand; absent means the level follows the zoom |
+| `mask=0x1f4` | which layers are visible |
+| `solo=8` | soloed layer, with `mask` carrying what to return to |
+| `color=1` | colour by cell class rather than by layer |
+| `alpha=1` | per-layer alpha |
+| `pick=x,y` | the selected placement, so "come look at this" means *this* |
+
+That is the one thing a desktop layout viewer structurally cannot do: paste a
+link into a review and have the other person land on the same rectangle.
 
 ## LOD
 

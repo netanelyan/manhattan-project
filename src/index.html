@@ -6,17 +6,40 @@
 <style>
   html, body { margin: 0; height: 100%; background: #0e0e10; overflow: hidden; }
   canvas { display: block; width: 100vw; height: 100vh; cursor: grab; }
-  #hud {
-    position: fixed; top: 10px; left: 10px;
+  #hud, #panel, #bar {
     color: #9fd49f; font: 12px/1.55 Consolas, "DejaVu Sans Mono", monospace;
-    white-space: pre; pointer-events: none;
     background: rgba(0, 0, 0, .58); padding: 8px 12px; border: 1px solid #24301f;
   }
+  #hud {
+    position: fixed; top: 10px; left: 10px;
+    white-space: pre; pointer-events: none;
+  }
+  /* Selection and jump-to sit at the bottom, out of the HUD's way, and look
+     like the HUD rather than like a framework arrived. */
+  #panel {
+    position: fixed; bottom: 10px; left: 10px; max-width: 60vw;
+    white-space: pre; display: none;
+  }
+  #panel.on { display: block; }
+  #bar {
+    position: fixed; bottom: 10px; left: 50%; transform: translateX(-50%);
+    display: none;
+  }
+  #bar.on { display: block; }
+  #bar label { color: #6f9a6f; }
+  #bar input {
+    background: transparent; border: none; outline: none; width: 26ch;
+    color: #cfe9cf; font: inherit;
+  }
+  #bar .note { color: #6f9a6f; }
 </style>
 </head>
 <body>
 <canvas id="c"></canvas>
 <div id="hud">loading...</div>
+<div id="panel"></div>
+<div id="bar"><label for="jump">go to x, y nm&nbsp;</label><input id="jump" spellcheck="false"
+  placeholder="482100, 918400"><span class="note">&nbsp;&nbsp;enter, esc</span></div>
 <script>
   // Module-level failures are otherwise silent: the page just sits at
   // "loading..." with nothing in the DOM to say why.
