@@ -33,7 +33,8 @@ Viewer keys:
 | key | |
 |---|---|
 | drag / wheel | pan, zoom |
-| `[` `]` | LOD level down / up |
+| `l` | automatic / manual LOD level |
+| `[` `]` | force the level down / up (switches to manual) |
 | `f` | fit the die |
 | `1`-`9` | toggle a layer |
 | `a` | all layers on / off |
@@ -55,6 +56,15 @@ pixels a cell covers:
 | **deep** | full master internals | ~11 | one per rect-count bucket (4) |
 | **mid** | one cell outline per placement | 1 | one |
 | **far** | merged density blocks, macros and power grid | n/a | one |
+
+The viewer picks its level from the zoom on the same basis, so what is drawn is
+what the level was built for. Each level's switch point is solved from this
+design's tile sizes and per-tile rectangle cost and from the live canvas size -
+they are not constants, and a bigger window moves them - with a 1.3x hysteresis
+band so the level does not flicker when the camera parks on a boundary. On a
+5M-placement design at 3424x1345 the worst on-screen count anywhere in the zoom
+range is 1.49M rectangles against the 2M budget, and mid geometry is given up at
+exactly 1.5 px per cell, before it turns into noise.
 
 Two things keep those numbers flat as designs grow. Deep draws group by
 *rect-count bucket*, not by master, so the draw count does not track library
@@ -79,6 +89,7 @@ are in [docs/tile-format.md](docs/tile-format.md).
 | `tools/serve.js` | static file server, core Node only |
 | `src/` | the viewer: plain ES modules, WebGL2, no framework |
 | `src/slots.js` | the hot path: one tile to its GPU slot records |
+| `src/lod.js` | switch points from zoom, solved per design and per canvas |
 | `src/tiles.js` | prioritised fetch queue and LRU cache |
 | `src/pool.js` | persistent GPU slot buffer with a free list |
 | `spike/stress.html` | completed throughput experiment, frozen |

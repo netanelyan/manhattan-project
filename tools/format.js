@@ -139,6 +139,73 @@ const MIN_CELL_PX  = 1.5;      // below this an outline is subpixel mud -> go fa
 const MAX_DEEP     = 2;        // internals only matter at the deepest levels
 const BLOCK_GRID   = 32;       // density blocks per side, per far tile
 
+// --- Runtime level choice.
+//
+// The generator picks a representation per level; the viewer has to pick which
+// level to draw at the camera's current zoom. It decides on the same two
+// numbers - the rectangle budget and how many pixels a cell covers - so what
+// is on screen is what the level was built for.
+//
+// These are the extra inputs that only matter at runtime.
+const REF_VIEW       = { w: 3440, h: 1440 };  // viewport the shipped ladder is quoted at
+const MAX_VIS_TILES  = 128;    // fetch rail: tiles one visible set may hold (4x VIS_TILES)
+const LOD_HYSTERESIS = 1.3;    // switch-in scale is this much above the switch-out scale
+
+// Tiles a viewport covers at a given scale:
+//
+//     (resW / (tileSize*scale) + 1) x (resH / (tileSize*scale) + 1)
+//
+// The +1 per axis is the partial tile hanging off each edge, and it is where a
+// coarse level's waste lives: at equal zoom a coarse level draws MORE
+// off-screen geometry than a fine one, because its edge tiles reach further
+// outside the viewport. Inverting this for the scale at which a level first
+// fits an allowance of N tiles is a quadratic in u = 1 / (tileSize*scale).
+function tilesOnScreen(resW, resH, tileSize, scale) {
+  return (resW / (tileSize * scale) + 1) * (resH / (tileSize * scale) + 1);
+}
+
+function scaleForTileAllowance(resW, resH, tileSize, allowance) {
+  if (!(allowance > 1)) return Infinity;             // one tile already busts it
+  const a = resW * resH, b = resW + resH, c = 1 - allowance;
+  const u = (-b + Math.sqrt(b * b - 4 * a * c)) / (2 * a);
+  return 1 / (tileSize * u);
+}
+
+// Switch-in scale for every level: the lowest camera scale at which that level
+// is allowed on screen, in device px per nm. Three constraints, whichever binds
+// hardest:
+//
+//   budget  this level's own tiles, plus its overflow list, fit RECT_BUDGET
+//   cells   a mean cell spans at least MIN_CELL_PX, for levels carrying
+//           placements - below that an outline is the noise the spike found,
+//           and density blocks carry more
+//   tiles   at most MAX_VIS_TILES tiles on screen, the fetch rail
+//
+// then forced monotone in z the same way kind assignment is, so the ladder is
+// ordered even where a finer level is the cheaper one to draw.
+//
+// levels: ascending z, each { z, kind, tileSize, rectsPerTile, overflowRects }
+function deriveSwitchPoints(levels, opt) {
+  const { resW, resH, rectBudget, minCellPx, meanCellWidth, maxTiles } = opt;
+  const out = [];
+  let floor = 0;
+  for (const L of levels) {
+    const per = L.rectsPerTile || 0;
+    const room = rectBudget - (L.overflowRects || 0);
+    const budget = per > 0 ? scaleForTileAllowance(resW, resH, L.tileSize, room / per) : 0;
+    const tiles = scaleForTileAllowance(resW, resH, L.tileSize, maxTiles);
+    const cells = L.kind === KIND_NAME[TILE_KIND.FAR] ? 0 : minCellPx / meanCellWidth;
+
+    let minScale = Math.max(budget, tiles, cells);
+    let bound = minScale === budget ? 'budget' : minScale === tiles ? 'tiles' : 'cells';
+    if (minScale < floor) { minScale = floor; bound = 'monotone'; }
+    if (L.z === 0) { minScale = 0; bound = 'floor'; }   // something must always be drawable
+    floor = minScale;
+    out.push({ z: L.z, minScale, bound, budget, tiles, cells });
+  }
+  return out;
+}
+
 module.exports = {
   MAGIC_MASTERS, MAGIC_TILE, VERSION,
   M_HEADER_BYTES, MASTER_BYTES, RECT_BYTES,
@@ -148,4 +215,6 @@ module.exports = {
   ABSTRACT_LAYER, BLOCK_KIND,
   OVERSIZE_FRAC, OVERFLOW_XY,
   RECT_BUDGET, VIS_TILES, TILE_PX, MIN_CELL_PX, MAX_DEEP, BLOCK_GRID,
+  REF_VIEW, MAX_VIS_TILES, LOD_HYSTERESIS, tilesOnScreen, scaleForTileAllowance,
+  deriveSwitchPoints,
 };

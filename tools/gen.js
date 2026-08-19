@@ -77,7 +77,7 @@ function emptyLevel(L, side) {
   return {
     z: L.z, kind: F.KIND_NAME[L.kind], tilesPerSide: side, tileSize: L.tileSize,
     tileCount: 0, recordBytes: F.RECORD_BYTES[L.kind], rectTotal: 0,
-    p95PerTile: L.p95, maxBuckets: 0, maxOverhang: 0, overflow: null,
+    p95PerTile: L.p95, rectP95PerTile: 0, maxBuckets: 0, maxOverhang: 0, overflow: null,
     coverage: Buffer.alloc(Math.ceil(side * side / 8)).toString('base64'),
   };
 }
@@ -205,6 +205,7 @@ function main() {
     const side = L.tilesPerSide;
     const present = new Uint8Array(side * side);
     let tiles = 0, bytes = 0, rects = 0, bucketsMax = 0, overhang = 0;
+    const perTile = [];
     if (opts.oneTile && L.z !== maxZ) { manifestLevels.push(emptyLevel(L, side)); continue; }
 
     // Features too big for this level's tiles are promoted out of the tile grid
@@ -247,6 +248,7 @@ function main() {
         fs.writeFileSync(path.join(d, `${Y}.bin`), out.buf);
         present[Y * side + X] = 1;
         tiles++; bytes += out.buf.length; rects += out.rectCount;
+        perTile.push(out.rectCount);
         if (out.bucketCount > bucketsMax) bucketsMax = out.bucketCount;
 
         // How far this level's geometry can reach outside its tile. The viewer
@@ -258,6 +260,13 @@ function main() {
       }
     }
 
+    // The runtime level choice budgets in rectangles, so it needs the p95 of
+    // what a tile at this level actually costs - not the p95 placement count
+    // planLevels worked from, which predates knowing the real rect spread.
+    perTile.sort((a, b) => a - b);
+    const rectP95 = perTile.length
+      ? perTile[Math.min(perTile.length - 1, Math.floor(perTile.length * 0.95))] : 0;
+
     manifestLevels.push({
       z: L.z,
       kind: F.KIND_NAME[L.kind],
@@ -267,6 +276,7 @@ function main() {
       recordBytes: F.RECORD_BYTES[L.kind],
       rectTotal: rects,
       p95PerTile: L.p95,
+      rectP95PerTile: rectP95,
       maxBuckets: bucketsMax,
       maxOverhang: overhang,
       overflow: overflow ? { count: overflow.count, rectCount: overflow.rectCount, bytes: overflow.buf.length } : null,
@@ -279,6 +289,38 @@ function main() {
       (bucketsMax ? `  ${bucketsMax} buckets/tile` : ''));
   }
   console.log(`  tiles       ${fmt(totalTiles)} written, ${mb(totalBytes)}, ${((Date.now() - tw) / 1000).toFixed(1)}s`);
+
+  // --- the LOD ladder: which level the viewer draws at which zoom.
+  //
+  // Derived, not tabulated, and from this design's own numbers - tile sizes and
+  // the p95 rectangle cost of a tile at each level - exactly as the bucket caps
+  // are derived from its rect-count histogram. Quoted here at a reference
+  // viewport; the viewer re-solves at its real canvas size, because the rect
+  // count on screen scales with viewport area and a 4K window is 3x a laptop.
+  const lodLevels = manifestLevels.map(L => ({
+    z: L.z, kind: L.kind, tileSize: L.tileSize,
+    rectsPerTile: L.rectP95PerTile,
+    overflowRects: L.overflow ? L.overflow.rectCount : 0,
+  }));
+  const meanCellWidth = Math.round(gen.meanW);
+  const switchPoints = F.deriveSwitchPoints(lodLevels, {
+    resW: F.REF_VIEW.w, resH: F.REF_VIEW.h,
+    rectBudget: F.RECT_BUDGET, minCellPx: F.MIN_CELL_PX,
+    meanCellWidth, maxTiles: F.MAX_VIS_TILES,
+  });
+
+  console.log(`  lod ladder  at the ${F.REF_VIEW.w}x${F.REF_VIEW.h} reference viewport; a level is switched IN at ` +
+              `${F.LOD_HYSTERESIS}x its switch-out scale, and the columns are quoted at switch-out, where it costs most`);
+  console.log('    z   kind   switch-out px/nm   nm/px   binds       tiles   rects on screen');
+  for (let i = 0; i < switchPoints.length; i++) {
+    const p = switchPoints[i], L = lodLevels[i];
+    const next = switchPoints[i + 1];
+    const shadowed = next && next.minScale <= p.minScale;
+    const s0 = p.minScale;
+    const t = s0 > 0 ? F.tilesOnScreen(F.REF_VIEW.w, F.REF_VIEW.h, L.tileSize, s0) : Infinity;
+    const r = t * L.rectsPerTile + L.overflowRects;
+    console.log(`    ${String(p.z).padStart(2)}  ${L.kind.padEnd(5)} ${s0.toExponential(3).padStart(15)} ${(s0 ? (1 / s0).toFixed(0) : '-').padStart(7)}   ${p.bound.padEnd(9)} ${(Number.isFinite(t) ? t.toFixed(1) : '-').padStart(7)} ${(Number.isFinite(r) ? fmt(Math.round(r)) : '-').padStart(17)}${shadowed ? '   (shadowed by z' + next.z + ')' : ''}`);
+  }
 
   const manifest = {
     version: F.VERSION,
@@ -294,10 +336,20 @@ function main() {
     rectCount: mInfo.rectCount,
     rectTexWidth: F.RECT_TEX_WIDTH,
     meanRectsPerInstance: +gen.meanRects.toFixed(2),
-    meanCellWidth: Math.round(gen.meanW),
     blockGrid: F.BLOCK_GRID,
     rectBudget: F.RECT_BUDGET,
     bucketCaps: caps,
+    meanCellWidth,
+    lod: {
+      refView: { w: F.REF_VIEW.w, h: F.REF_VIEW.h },
+      minCellPx: F.MIN_CELL_PX,
+      maxVisibleTiles: F.MAX_VIS_TILES,
+      hysteresis: F.LOD_HYSTERESIS,
+      switchPoints: switchPoints.map(p => ({
+        z: p.z, bound: p.bound,
+        minScale: Number.isFinite(p.minScale) ? +p.minScale.toPrecision(6) : null,
+      })),
+    },
     bucketPadding: +cost.waste.toFixed(4),
     oversizeFrac: F.OVERSIZE_FRAC,
     maxRectsPerMaster: maxRects,

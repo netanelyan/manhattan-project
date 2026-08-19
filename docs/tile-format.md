@@ -396,6 +396,16 @@ Bootstrap metadata. The only file parsed as text, fetched once.
   "blockGrid": 32,
   "rectBudget": 2000000,
   "bucketCaps": [8, 16, 32, 64],
+  "lod": {
+    "refView": { "w": 3440, "h": 1440 },
+    "minCellPx": 1.5,
+    "maxVisibleTiles": 128,
+    "hysteresis": 1.3,
+    "switchPoints": [
+      { "z": 0, "bound": "floor",  "minScale": 0 },
+      { "z": 4, "bound": "cells",  "minScale": 0.00229 }
+    ]
+  },
   "oversizeFrac": 0.25,
   "maxRectsPerMaster": 44,
   "partial": false,
@@ -409,6 +419,7 @@ Bootstrap metadata. The only file parsed as text, fetched once.
       "recordBytes": 12,
       "rectTotal": 5514009,
       "p95PerTile": 2684,
+      "rectP95PerTile": 29192,
       "maxBuckets": 3,
       "maxOverhang": 3800,
       "overflow": { "count": 426, "rectCount": 426, "bytes": 5176 },
@@ -427,6 +438,17 @@ Bootstrap metadata. The only file parsed as text, fetched once.
   none. Far levels never have one - their geometry is clipped.
 - `bucketCaps` is the resolved bucket cap list for this library; a consumer must
   agree with it or deep tiles will draw wrong.
+- `p95PerTile` is the 95th-percentile *placement* count over this level's
+  non-empty tiles, the number the generator planned kinds from.
+  `rectP95PerTile` is the same percentile of what a tile actually costs to
+  draw, taken over the tiles as written, and it is what the runtime level
+  choice budgets against.
+- `lod` holds the level-choice policy plus the ladder solved at `refView`.
+  `switchPoints[z].minScale` is the lowest camera scale, in device px per nm,
+  at which level `z` may be drawn, and `bound` names the constraint that set
+  it. A viewer with a different canvas re-solves from `tileSize`,
+  `rectP95PerTile`, `overflow` and `rectBudget`; see "Choosing a level at
+  runtime". One entry per level, ascending `z`, monotone.
 - `coverage` is a base64 row-major bitmap, bit `ty · tilesPerSide + tx`, LSB
   first within each byte. A set bit means the file exists. This is what stops the
   viewer requesting tiles that were never written — cheaper than listing 16k
@@ -496,6 +518,122 @@ The generator also sizes power strap segments to one deepest-level tile and
 aligns them to tile boundaries. Real tilers split long wires at tile borders for
 the same reason. Without that, tens of thousands of 25 µm strap segments
 straddled tile edges and landed in the overflow list for no benefit.
+
+## Choosing a level at runtime
+
+The generator decides what each level *is*. The viewer decides which one to
+draw, and it decides on the same two numbers — the rectangle budget and how many
+pixels a cell covers — so what reaches the screen is what the level was built
+for. The rule lives in `src/lod.js`; `[` and `]` still force a level by hand for
+debugging, and `l` returns to automatic.
+
+### The ladder
+
+Every level gets one **switch-out scale**: the lowest camera scale, in device
+pixels per nanometre, at which it is allowed on screen. Three constraints,
+whichever binds hardest, then forced monotone in `z`:
+
+| binds | the level is refused below the scale where … |
+|---|---|
+| `budget` | its tiles, plus its always-resident overflow list, fit `rectBudget` |
+| `cells` | a mean cell spans `minCellPx` — placement levels only |
+| `tiles` | at most `maxVisibleTiles` tiles are on screen |
+
+A viewport of `resW × resH` device pixels at scale `s` covers
+
+```
+tiles(z, s) = (resW / (tileSize(z)·s) + 1) · (resH / (tileSize(z)·s) + 1)
+rects(z, s) = tiles(z, s) · rectP95PerTile(z) + overflow.rectCount
+```
+
+and each constraint is one of those inverted for `s` — a quadratic in
+`u = 1 / (tileSize·s)`.
+
+The `+1` per axis is the partial tile hanging off each edge, and it is not a
+rounding detail: **at equal zoom a coarse level draws more off-screen geometry
+than a fine one**, because its edge tiles reach further outside the viewport. So
+for two levels of the same kind the *finer* one is the cheaper one to draw, and
+the ladder would not come out ordered on its own — hence the monotone pass, the
+same one kind assignment gets.
+
+The `cells` bound is what keeps mid geometry off a full-die view. It is a
+property of the zoom alone, not of the level: a mean cell is `meanCellWidth · s`
+pixels wide wherever it is drawn from, and below `MIN_CELL_PX` an outline is the
+noise the spike found, while density blocks still carry the floorplan.
+
+### Hysteresis
+
+A bare threshold makes the level flicker whenever the camera parks on it. Each
+level's **switch-in** scale is `hysteresis` times its switch-out scale, and the
+whole band sits at or above the scale the level was cleared for:
+
+```
+switch in to z   when   s >= minScale(z) · hysteresis
+hold z           while  s >= minScale(z)
+otherwise               the finest level whose switch-in scale is met
+```
+
+Stickiness is therefore only ever spent staying coarse — a level is never drawn
+below the zoom its budget was proved at, only above the zoom that would have
+promoted it. One wheel notch is `exp(0.0015 · 100)` = 1.16×, so `hysteresis`
+must exceed that or a single notch could round-trip; 1.3 leaves about a notch of
+dead zone. The first pick after load ignores the band: nothing is on screen yet
+to flicker, and opening one level coarser than the zoom justifies would leave it
+there until the camera moved.
+
+### Switch points are data, not constants
+
+They follow from the design — tile sizes, and the p95 rectangle cost of a tile
+at each level — and from the window, since rectangles on screen scale with
+viewport area. A 3440×1440 canvas at `dpr` 2 costs 5.6× a 1920×1080 one at the
+same zoom, which is more than the whole gap between two levels. So the manifest
+ships the inputs, `manifest.lod.switchPoints` ships the ladder solved at a
+reference viewport for reference and for the docs, and the viewer re-solves
+against its real canvas at boot and on every resize. `tools/verify.js` checks
+that the viewer's copy of the rule reproduces the shipped ladder exactly, since
+two implementations of one rule drift.
+
+### Measured
+
+`?sweep=1` walks the zoom range through the real selector in both directions,
+records where the level actually changes, then parks the camera at each of those
+scales and reads the rectangle count the renderer is holding. 4,990,711
+placements, 3424×1345 canvas, worst of five camera positions:
+
+| switch | at px/nm | nm/px | cell px | before | after |
+|---|---|---|---|---|---|
+| in, z1→z2 | 4.410e-4 | 2268 | 0.31 | far, 3,931 rects / 4 tiles | far, 14,998 / 16 |
+| in, z2→z3 | 8.820e-4 | 1134 | 0.63 | far, 14,998 / 16 | far, 43,272 / 48 |
+| in, z3→z4 | 2.736e-3 | 365 | 1.95 | far, 13,600 / 15 | **mid, 798,822 / 41** |
+| in, z4→z6 | 7.569e-3 | 132 | 5.40 | mid, 179,106 / 9 | **deep, 876,767 / 73** |
+| out, z6→z4 | 5.793e-3 | 173 | 4.14 | **deep, 1,488,731 / 121** | mid, 312,554 / 16 |
+| out, z4→z3 | 2.094e-3 | 478 | 1.50 | **mid, 1,303,944 / 67** | far, 20,263 / 24 |
+| out, z3→z2 | 6.750e-4 | 1481 | 0.48 | far, 58,800 / 64 | far, 14,998 / 16 |
+| out, z2→z1 | 3.375e-4 | 2963 | 0.24 | far, 14,998 / 16 | far, 3,931 / 4 |
+
+The bold rows are the two that matter: the worst on-screen count anywhere in the
+sweep is 1,488,731 rectangles, at the deepest level just before it is given up,
+against a 2,000,000 budget — 74%, with the remainder absorbing the gap between
+the p95 estimate and a genuinely unlucky viewport. Nothing hit the
+`maxVisibleTiles` rail; the ladder gave the level up first, at 121 tiles.
+
+The `cells` bound lands exactly where it was aimed: 1.50 px per cell leaving mid
+on the way out, 1.95 px arriving on the way in, the band being the 1.3×.
+
+Two things the sweep shows that the ladder alone does not:
+
+- **z5 is never selected.** It shares z6's switch-out scale after the monotone
+  pass, so the finest deep level always wins — which is the `+1` again, z5's
+  coarser tiles hanging further off the edges. The level costs 57 MB and buys
+  nothing at runtime; `MAX_DEEP` could be 1 for this design.
+- **The estimate runs high at coarse levels** (est 135k against 15k measured at
+  z2). It assumes a full screen of tiles, and far levels have fewer tiles in
+  existence than the screen would hold. That is the right conservative
+  direction for a budget, and it is why the `tiles` bound rather than `budget`
+  is what selects among far levels — it is a mip-resolution rule wearing a fetch
+  rail's clothes.
+
+---
 
 ## Streaming and eviction
 
@@ -693,7 +831,7 @@ per-level quantum in the contract, so it is not done.
 | layer visibility, colour modes, tile overlay | done |
 | prioritised on-demand loading, prefetch ring | done |
 | LRU eviction against a byte budget | done |
-| LOD level chosen from zoom | not yet — manual `[` / `]` in the viewer (step 4) |
+| LOD level chosen from zoom | done — derived ladder with hysteresis, `[` / `]` / `l` override |
 | cross-fade between levels | not implemented — two opaque passes composited, see Known constraints |
 | translucent layers | not planned, see Known constraints |
 

@@ -233,5 +233,55 @@ for (const lvl of manifest.levels) {
 }
 
 console.log(`total       ${totalTiles.toLocaleString()} tiles, ${(totalBytes / 1048576).toFixed(1)} MB`);
-console.log(fails === 0 ? 'OK' : `${fails} FAILURES`);
-process.exit(fails === 0 ? 0 : 1);
+
+// ---------------------------------------------------------------- lod ladder
+//
+// The switch points shipped in the manifest are derived from the level table;
+// the viewer re-derives them from the same fields, in its own copy of the rule
+// (src/lod.js). Two implementations of one rule drift, so this checks that the
+// viewer's copy reproduces the shipped ladder exactly, and that the ladder
+// keeps the promises it is made of: ordered by z, inside the rectangle budget,
+// inside the tile rail.
+import('../src/lod.js').then(LOD => {
+  const lod = manifest.lod;
+  check(!!lod, 'manifest has a lod block');
+  if (!lod) return;
+  const ref = LOD.deriveLadder(manifest, lod.refView.w, lod.refView.h, lod.maxVisibleTiles);
+  check(ref.length === lod.switchPoints.length, 'ladder length matches level count');
+
+  let prev = -Infinity;
+  for (let i = 0; i < ref.length; i++) {
+    const a = ref[i], b = lod.switchPoints[i];
+    const L = manifest.levels[i];
+    check(a.z === b.z, `ladder z${a.z} order`);
+    check(a.bound === b.bound, `ladder z${a.z} binding constraint ${a.bound} vs ${b.bound}`);
+    // Compared at the precision the manifest ships, so this catches drift
+    // between the two derivations and nothing else.
+    const shipped = Number.isFinite(a.minScale) ? +a.minScale.toPrecision(6) : null;
+    check(shipped === b.minScale,
+          `ladder z${a.z} switch scale ${shipped} vs shipped ${b.minScale}`);
+    check(a.minScale >= prev, `ladder z${a.z} not monotone in z`);
+    prev = a.minScale;
+
+    if (a.minScale > 0 && Number.isFinite(a.minScale)) {
+      const t = LOD.tilesOnScreen(lod.refView.w, lod.refView.h, L.tileSize, a.minScale);
+      const r = t * L.rectP95PerTile + (L.overflow ? L.overflow.rectCount : 0);
+      check(r <= manifest.rectBudget * 1.0001,
+            `z${a.z} would draw ${Math.round(r)} rects at its own switch scale, budget ${manifest.rectBudget}`);
+      check(t <= lod.maxVisibleTiles * 1.0001,
+            `z${a.z} would need ${t.toFixed(1)} tiles at its own switch scale, rail ${lod.maxVisibleTiles}`);
+    }
+    check(L.tileCount === 0 || L.rectP95PerTile > 0, `z${a.z} has a rect p95`);
+  }
+  check(lod.hysteresis > 1.16, `hysteresis ${lod.hysteresis} must exceed one wheel notch (1.16x)`);
+
+  const shadowed = ref.filter((p, i) => ref[i + 1] && ref[i + 1].minScale <= p.minScale).map(p => p.z);
+  console.log(`lod         ${ref.map(p => 'z' + p.z + ' ' + p.minScale.toExponential(2)).join('  ')}` +
+              `  hysteresis ${lod.hysteresis}x` +
+              (shadowed.length ? `  (never selected: z${shadowed.join(', z')})` : ''));
+}).catch(e => {
+  check(false, 'lod ladder: ' + e.message);
+}).finally(() => {
+  console.log(fails === 0 ? 'OK' : `${fails} FAILURES`);
+  process.exit(fails === 0 ? 0 : 1);
+});
