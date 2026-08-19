@@ -7,13 +7,29 @@ const ROW_H  = 1000;   // nm, standard cell row height (site height)
 const SITE_W = 200;    // nm, placement grid pitch
 const DBU_PER_MICRON = 1000;
 
-const N_STD   = 390;   // standard cell masters
-const N_MACRO = 6;     // memory macro masters
-const N_PWR   = 4;     // power strap segment masters
-                       // 400 masters total
+// Library size matching superblue16's cells.lef. Every measurement taken
+// against a few hundred masters is optimistic: draw-call strategies that look
+// fine at 400 masters fall over here.
+const N_STD   = 4606;  // logic cell masters
+const N_FILL  = 8;     // filler and decap masters
+const N_MACRO = 12;    // memory macro masters
+const N_PWR   = 8;     // power strap segment masters
+                       // 4634 masters total
+
+// Share of placements that are fillers and decoupling caps rather than logic.
+// A real design is largely made of these: simple boxes, a handful of masters,
+// instanced enormously. They dominate the low end of the rect-count histogram.
+const FILL_SHARE = 0.30;
+
+// Placement frequency across the logic library follows a Zipf tail: a few
+// masters take most of the placements and thousands take the rest. Sampling
+// uniformly across 4,634 masters is nothing like a real design.
+const ZIPF_S = 1.05;
+const ZIPF_Q = 2.7;
 
 const PWR_PITCH = 50000;        // nm between power straps, both directions
-const PWR_SEG   = 25000;        // nm length of one strap segment master
+const PWR_SEG_FIXED = 25000;    // nm, unaligned strap segment length
+const PWR_PHASE = 7000;         // nm, offset so straps do not sit on tile edges
 const MACRO_AREA_FRAC = 0.12;   // fraction of die area consumed by macros
 
 // Layer ids. The viewer's palette and the depth-sort key both index this.
@@ -145,6 +161,26 @@ function buildMacro(rects, w, h) {
   return { rectStart: start, rectCount: rects.length / 8 - start, w, h, klass: K.MACRO, rowH: 0 };
 }
 
+// Filler and decap cells: implant/nwell plus power rails, and for a decap a
+// gate over diffusion. Three to five rectangles, nothing else - which is
+// exactly why they matter for bucket sizing.
+function buildFiller(rects, w, decap) {
+  const start = rects.length / 8;
+  const h = ROW_H;
+  const railH = 120;
+  pushRect(rects, 0, 0, w, railH, L.METAL1, 0);
+  pushRect(rects, 0, h - railH, w, railH, L.METAL1, 0);
+  pushRect(rects, 0, railH, w, h - 2 * railH, L.NWELL, 0);
+  if (decap) {
+    pushRect(rects, 60, 200, w - 120, 600, L.DIFF, 0);
+    pushRect(rects, Math.floor(w / 2) - 50, 150, 100, 700, L.POLY, 0);
+  }
+  return {
+    rectStart: start, rectCount: rects.length / 8 - start,
+    w, h, klass: K.STD, rowH: ROW_H,
+  };
+}
+
 function buildStrap(rects, w, h) {
   const start = rects.length / 8;
   pushRect(rects, 0, 0, w, h, L.PWR, 0);
@@ -158,25 +194,53 @@ function generate(opts) {
   const rects = [];
   const masters = [];
 
-  // --- standard cell library. Widths 400..4000nm on the 200nm site grid.
-  // Usage frequency is skewed small: inverters and NANDs dominate a real design.
-  const stdWeights = new Float64Array(N_STD);
+  // --- logic cell library. Widths 400..4000nm on the 200nm site grid.
+  const sitesOf = new Int32Array(N_STD);
   for (let i = 0; i < N_STD; i++) {
     const sites = 2 + Math.floor(Math.pow(rand(), 1.9) * 19);   // 2..20 sites
+    sitesOf[i] = sites;
     masters.push(buildStdCell(rects, sites * SITE_W));
-    stdWeights[i] = 1 / (sites * sites * 0.35 + 1);
   }
-  let wsum = 0;
-  for (let i = 0; i < N_STD; i++) wsum += stdWeights[i];
-  const stdCdf = new Float64Array(N_STD);
+
+  // --- filler and decap library: a handful of very simple, very common cells.
+  const fillBase = masters.length;
+  for (let i = 0; i < N_FILL; i++) {
+    const decap = i >= N_FILL / 2;
+    const sites = decap ? [4, 8, 16, 32][i - (N_FILL >> 1)] : [1, 2, 4, 8][i];
+    masters.push(buildFiller(rects, sites * SITE_W, decap));
+  }
+
+  // --- placement frequency. Logic follows a Zipf tail ranked by size, so small
+  // inverters and buffers dominate; fillers and decaps take FILL_SHARE of
+  // everything between them.
+  const rank = Array.from({ length: N_STD }, (_, i) => i);
+  rank.sort((a, b) => (sitesOf[a] + rand() * 6) - (sitesOf[b] + rand() * 6));
+  const weights = new Float64Array(masters.length);
+  let logicSum = 0;
+  for (let r = 0; r < N_STD; r++) {
+    const w = 1 / Math.pow(r + 1 + ZIPF_Q, ZIPF_S);
+    weights[rank[r]] = w;
+    logicSum += w;
+  }
+  for (let i = 0; i < N_STD; i++) weights[i] *= (1 - FILL_SHARE) / logicSum;
+  const fillW = [0.30, 0.24, 0.16, 0.10, 0.08, 0.06, 0.04, 0.02];
+  for (let i = 0; i < N_FILL; i++) weights[fillBase + i] = FILL_SHARE * fillW[i];
+
+  // --- flat CDF over everything placeable, plus the rect-count histogram the
+  // bucket caps are derived from.
+  const nPlaceable = N_STD + N_FILL;
+  const cdf = new Float64Array(nPlaceable);
+  const rectHist = new Map();
   let acc = 0, meanW = 0, meanRects = 0;
-  for (let i = 0; i < N_STD; i++) {
-    const p = stdWeights[i] / wsum;
+  for (let i = 0; i < nPlaceable; i++) {
+    const p = weights[i];
     meanW += p * masters[i].w;
     meanRects += p * masters[i].rectCount;
-    acc += p; stdCdf[i] = acc;
+    const rc = masters[i].rectCount;
+    rectHist.set(rc, (rectHist.get(rc) || 0) + p);
+    acc += p; cdf[i] = acc;
   }
-  stdCdf[N_STD - 1] = 1;
+  cdf[nPlaceable - 1] = 1;
 
   // --- die size, solved analytically from meanW and the mean density.
   // Each fill step advances by one master width whether or not it places, so
@@ -188,6 +252,24 @@ function generate(opts) {
   const dieW = Math.max(SITE_W * 256, Math.round(side / SITE_W) * SITE_W);
   const dieH = Math.max(ROW_H * 64, Math.round(side / ROW_H) * ROW_H);
   const numRows = dieH / ROW_H;
+
+  // --- pyramid geometry, decided here because the power grid depends on it.
+  // maxZ comes from the requested count, not the achieved one, so it is
+  // deterministic and the strap masters below can be sized against it.
+  const maxZ = Math.max(0, Math.ceil(Math.log2(Math.sqrt(stdTarget / opts.perTile))));
+  const tilesPerSide = 1 << maxZ;
+  const tileSize = Math.ceil(Math.max(dieW, dieH) / tilesPerSide / SITE_W) * SITE_W;
+  const worldSize = tileSize * tilesPerSide;
+
+  // Power strap segmentation. Real grids do not respect tile boundaries, so
+  // unaligned is the default: fixed-length segments on a phase offset, which
+  // straddle tile edges and land in the overflow list. `--strap-align` sizes
+  // segments to one deepest tile and snaps them, removing the bleed entirely -
+  // a legitimate tiler optimisation, but it must not be the only mode, or the
+  // overflow path goes untested against what a real parser will produce.
+  const aligned = opts.strapAlign === true;
+  const PWR_SEG = aligned ? tileSize : PWR_SEG_FIXED;
+  const PWR_OFF = aligned ? 0 : PWR_PHASE;
 
   // --- macro masters, sized relative to the die.
   const macroBase = masters.length;
@@ -201,10 +283,11 @@ function generate(opts) {
   }
   // --- power strap masters.
   const pwrBase = masters.length;
-  masters.push(buildStrap(rects, 800, PWR_SEG));    // narrow vertical
-  masters.push(buildStrap(rects, PWR_SEG, 800));    // narrow horizontal
-  masters.push(buildStrap(rects, 1600, PWR_SEG));   // wide vertical
-  masters.push(buildStrap(rects, PWR_SEG, 1600));   // wide horizontal
+  // four strap widths, vertical and horizontal, all one tile long
+  for (const t of [800, 1600, 2400, 3200]) {
+    masters.push(buildStrap(rects, t, PWR_SEG));    // vertical
+    masters.push(buildStrap(rects, PWR_SEG, t));    // horizontal
+  }
 
   // --- place macros, non-overlapping, snapped to the placement grid.
   const macros = [];
@@ -236,15 +319,16 @@ function generate(opts) {
   const macroCount = n;
 
   // --- power grid, on its own layer, spanning the whole die.
-  for (let gx = PWR_PITCH; gx < dieW - 1600; gx += PWR_PITCH) {
-    const wide = ((gx / PWR_PITCH) | 0) % 4 === 0;
-    const mid = pwrBase + (wide ? 2 : 0);
-    for (let y = 0; y + PWR_SEG <= dieH; y += PWR_SEG) emit(mid, gx, y, O.N);
+  // Every fourth strap is a wide trunk, the rest are narrower distribution
+  // straps - the coarse grid a real floorplan gets.
+  const strapWidth = k => (k % 4 === 0 ? 3 : k % 2 === 0 ? 1 : 0);
+  for (let gx = PWR_PITCH, k = 1; gx < dieW - 3200; gx += PWR_PITCH, k++) {
+    const mid = pwrBase + strapWidth(k) * 2;
+    for (let y = PWR_OFF; y + PWR_SEG <= dieH; y += PWR_SEG) emit(mid, gx, y, O.N);
   }
-  for (let gy = PWR_PITCH; gy < dieH - 1600; gy += PWR_PITCH) {
-    const wide = ((gy / PWR_PITCH) | 0) % 4 === 0;
-    const mid = pwrBase + (wide ? 3 : 1);
-    for (let x = 0; x + PWR_SEG <= dieW; x += PWR_SEG) emit(mid, x, gy, O.N);
+  for (let gy = PWR_PITCH, k = 1; gy < dieH - 3200; gy += PWR_PITCH, k++) {
+    const mid = pwrBase + strapWidth(k) * 2 + 1;
+    for (let x = PWR_OFF; x + PWR_SEG <= dieW; x += PWR_SEG) emit(mid, x, gy, O.N);
   }
   const pwrCount = n - macroCount;
 
@@ -263,10 +347,10 @@ function generate(opts) {
       for (const m of rowMacros) if (x >= m.x && x < m.x + m.w) { blocked = m; break; }
       if (blocked) { x = blocked.x + blocked.w; continue; }
 
-      // pick a master from the skewed usage distribution
+      // pick a master from the Zipf-plus-filler usage distribution
       const u = rand();
-      let lo = 0, hi = N_STD - 1;
-      while (lo < hi) { const mid = (lo + hi) >> 1; if (stdCdf[mid] < u) lo = mid + 1; else hi = mid; }
+      let lo = 0, hi = cdf.length - 1;
+      while (lo < hi) { const mid = (lo + hi) >> 1; if (cdf[mid] < u) lo = mid + 1; else hi = mid; }
       const mw = masters[lo].w;
       if (x + mw > dieW) break;
       let clip = false;
@@ -284,10 +368,12 @@ function generate(opts) {
       m: im.subarray(0, n), o: io.subarray(0, n), n,
     },
     dieW, dieH, numRows,
+    maxZ, tilesPerSide, tileSize, worldSize,
     macroCount, pwrCount,
     stdCount: n - macroCount - pwrCount,
     densityMean: density.mean,
-    meanW, meanRects,
+    meanW, meanRects, rectHist,
+    strapAligned: aligned, strapSeg: PWR_SEG,
     genMs: Date.now() - t0,
   };
 }
@@ -295,5 +381,5 @@ function generate(opts) {
 module.exports = {
   generate, mulberry32, makeDensityField,
   ROW_H, SITE_W, DBU_PER_MICRON, L, K, O,
-  N_STD, N_MACRO, N_PWR, PWR_PITCH, PWR_SEG,
+  N_STD, N_FILL, N_MACRO, N_PWR, PWR_PITCH, FILL_SHARE,
 };

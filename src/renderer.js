@@ -1,69 +1,124 @@
-// WebGL2 instanced renderer.
+// WebGL2 renderer.
 //
-// Geometry lives in an RGBA32I texture built once from masters.bin: two texels
-// per rectangle, addressed by rect index. A draw call says "master m, rect
-// range [base, base+count), N instances" and the vertex shader expands
-// gl_VertexID into rect index + quad corner, fetching the rect from the
-// texture. No per-master vertex buffers, no CPU-side geometry expansion.
+// DRAW GROUPING. Deep tiles are grouped by *rect count bucket*, not by master.
+// Every instance carries its master id and the vertex shader looks the geometry
+// up in a texture, so one draw call covers every master in the bucket. Grouping
+// by master made the draw count equal the library size - ~4,600 for a real
+// cells.lef, which does not fit a 16.7ms frame. Bucketing makes it a constant:
+// one call per bucket, four of them, whatever the library holds. The price is
+// surplus vertices for masters below their bucket cap, discarded as degenerate
+// triangles.
 //
-// Per-instance data is a single staging buffer holding every visible instance
-// grouped by master, so one draw call covers a master across all visible tiles.
-// The staging buffer is rebuilt only when the visible tile set, the LOD level
-// or the view origin changes - never on a plain pan or zoom.
+// BUFFERS. Slots are persistent. A slot record is origin-independent -
+// tile-local coordinates plus a tile index - so it is written once when a tile
+// loads and never rewritten. Panning changes a uniform; a view-origin resnap
+// changes a small per-tile origin table. Neither rebuilds a buffer. A
+// visible-set change costs only the tiles entering and leaving.
 //
-// Local origin fix: staging holds (instanceWorld - viewOrigin) computed in f64
-// on the CPU and stored as f32. viewOrigin tracks the camera, so the f32 values
-// stay small no matter how deep the zoom goes.
+// TEXTURES. masters.bin is uploaded verbatim as two RGBA32I textures - the
+// master table (2 texels per master: rectStart, rectCount, w, h / klass, rowH)
+// and the rect table (2 texels per rect). No CPU-side geometry expansion.
 
-import { RECT_TEX_WIDTH, M_STRIDE, M_RECT_START, M_RECT_COUNT, M_W, M_H,
-         G_STRIDE, G_MASTER, G_START, G_COUNT, I_STRIDE } from './format.js';
+import { RECT_TEX_WIDTH, TILE_KIND, I_STRIDE, KLASS,
+         LAYER_CELLBOX, LAYER_MACROBOX, LAYER_POWERBOX } from './format.js';
+import { SlotPool } from './pool.js';
+import { PLACEMENT_SLOT_I32, BLOCK_SLOT_I32, buildPlacementSlots, buildBlockSlots,
+         fillFreePlacements, fillFreeBlocks, tileBuckets } from './slots.js';
 
-// Layer palette, indexed by the layer id stored in each rect.
 export const LAYER_NAMES = [
   'outline', 'nwell', 'diff', 'poly', 'contact', 'metal1',
   'via1', 'metal2', 'metal3', 'pin', 'macro', 'power',
+  'cellbox', 'macrobox', 'powerbox', '-',
 ];
 const PALETTE = [
   [0.23, 0.23, 0.27], [0.16, 0.18, 0.23], [0.18, 0.42, 0.31], [0.69, 0.29, 0.29],
   [0.85, 0.85, 0.85], [0.24, 0.44, 0.72], [0.81, 0.81, 0.38], [0.72, 0.40, 0.24],
   [0.48, 0.31, 0.72], [0.88, 0.75, 0.25], [0.29, 0.29, 0.35], [0.78, 0.31, 0.24],
-  [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0],
+  [0.34, 0.52, 0.74], [0.40, 0.38, 0.50], [0.82, 0.34, 0.26], [0, 0, 0],
 ];
 
+// Keys 1-9 toggle these layers: the ones worth hiding while reading a layout.
+export const TOGGLE_LAYERS = [2, 3, 4, 5, 6, 7, 8, 9, 11];
+
+const MAX_TILE_SLOTS = 1024;      // resident tiles addressable by the origin table
+const TILE_TEX_WIDTH = 256;
 const LOG2_TEXW = Math.log2(RECT_TEX_WIDTH) | 0;
 
-const VS = `#version 300 es
+// Shared shader preamble: master/rect lookup, the per-tile origin table, layer
+// visibility, colour mode, and the projection that uses the layer id as a depth
+// key so painting order needs no sorting.
+const COMMON = `
 precision highp float;
 precision highp int;
 
-layout(location=0) in vec2  a_delta;    // instance origin minus view origin, nm
-layout(location=1) in float a_orient;   // LEF orientation 0..7
+uniform highp isampler2D u_masters;   // 2 texels per master
+uniform highp isampler2D u_rects;     // 2 texels per rect
+uniform highp sampler2D  u_tiles;     // per-tile origin minus view origin
 
-uniform highp isampler2D u_rects;
-uniform int   u_rectBase;   // first rect of this master
-uniform ivec2 u_bbox;       // master bounding box, nm
-uniform vec2  u_cam;        // camera centre minus view origin, nm
-uniform float u_scale;      // device px per nm
-uniform vec2  u_res;        // device px
-uniform float u_minPx;      // drop rects smaller than this on screen
+uniform vec2  u_cam;
+uniform float u_scale;
+uniform vec2  u_res;
+uniform float u_minPx;
+uniform int   u_layerMask;
+uniform int   u_colorMode;            // 0 = by layer, 1 = by class
 
 flat out int v_layer;
+out float v_density;
 
-const int QI[6] = int[6](0, 1, 2, 2, 1, 3);
-
+ivec4 fetchMaster(int i) {
+  return texelFetch(u_masters, ivec2(i & ${RECT_TEX_WIDTH - 1}, i >> ${LOG2_TEXW}), 0);
+}
 ivec4 fetchRect(int i) {
   return texelFetch(u_rects, ivec2(i & ${RECT_TEX_WIDTH - 1}, i >> ${LOG2_TEXW}), 0);
 }
+vec2 tileOrigin(int s) {
+  return texelFetch(u_tiles, ivec2(s & ${TILE_TEX_WIDTH - 1}, s >> 8), 0).xy;
+}
+bool layerHidden(int layer) {
+  return (u_layerMask & (1 << layer)) == 0;
+}
+int classLayer(int klass) {
+  return klass == ${KLASS.MACRO} ? ${LAYER_MACROBOX}
+       : klass == ${KLASS.PWR}   ? ${LAYER_POWERBOX} : ${LAYER_CELLBOX};
+}
+void emitQuad(vec2 world, vec2 size, vec2 corner, int layer, float density) {
+  vec2 p = (world + corner * size - u_cam) * u_scale + 0.5 * u_res;
+  float z = 1.0 - float(layer) * (1.0 / 16.0);
+  gl_Position = vec4(p.x / u_res.x * 2.0 - 1.0, 1.0 - p.y / u_res.y * 2.0, z, 1.0);
+  v_layer = layer;
+  v_density = density;
+}
+void discardVertex() { gl_Position = vec4(0.0, 0.0, 0.0, -1.0); }
+`;
+
+// Deep: one draw call per bucket. gl_VertexID splits into (rect index, corner);
+// surplus rects beyond this master's own count collapse.
+const VS_DEEP = `#version 300 es
+${COMMON}
+layout(location=0) in ivec2 a_pos;      // tile-local nm
+layout(location=1) in int   a_packed;   // masterId | orient<<16, -1 when free
+layout(location=2) in int   a_tileSlot;
+
+const int QI[6] = int[6](0, 1, 2, 2, 1, 3);
 
 void main() {
-  int t = (u_rectBase + gl_VertexID / 6) * 2;
-  ivec4 g = fetchRect(t);        // x, y, w, h  (cell-local nm)
-  ivec4 e = fetchRect(t + 1);    // layer, flags, -, -
+  if (a_packed < 0) { discardVertex(); return; }        // released slot
+  int m = a_packed & 0xffff;
+  int o = (a_packed >> 16) & 0xff;
+
+  ivec4 mi = fetchMaster(m * 2);                        // rectStart, rectCount, w, h
+  int localRect = gl_VertexID / 6;
+  if (localRect >= mi.y) { discardVertex(); return; }   // surplus for this bucket
+
+  int t = (mi.x + localRect) * 2;
+  ivec4 g = fetchRect(t);                               // x, y, w, h (cell-local)
+  ivec4 e = fetchRect(t + 1);                           // layer, flags, -, -
+  if (layerHidden(e.x)) { discardVertex(); return; }
 
   int rx = g.x, ry = g.y, rw = g.z, rh = g.w;
-  int W = u_bbox.x, H = u_bbox.y;
+  int W = mi.z, H = mi.w;
   int ox, oy, ow, oh;
-  switch (int(a_orient + 0.5)) {
+  switch (o) {
     case 0:  ox = rx;          oy = ry;          ow = rw; oh = rh; break;  // N
     case 1:  ox = W - rx - rw; oy = H - ry - rh; ow = rw; oh = rh; break;  // S
     case 2:  ox = H - ry - rh; oy = rx;          ow = rh; oh = rw; break;  // W
@@ -74,102 +129,204 @@ void main() {
     default: ox = ry;          oy = rx;          ow = rh; oh = rw; break;  // FE
   }
 
-  float fw = float(ow), fh = float(oh);
-  if (max(fw, fh) * u_scale < u_minPx) {
-    gl_Position = vec4(0.0, 0.0, 0.0, -1.0);   // collapse behind the near plane
-    return;
-  }
+  vec2 size = vec2(float(ow), float(oh));
+  if (max(size.x, size.y) * u_scale < u_minPx) { discardVertex(); return; }
 
+  int layer = u_colorMode == 1 ? classLayer(fetchMaster(m * 2 + 1).x) : e.x;
   int q = QI[gl_VertexID % 6];
-  vec2 corner = vec2(float(q & 1), float(q >> 1));
-  vec2 world = a_delta + vec2(float(ox), float(oy)) + corner * vec2(fw, fh);
-  vec2 px = (world - u_cam) * u_scale + 0.5 * u_res;
-
-  // Layer index doubles as a depth key, so metal draws over poly draws over
-  // diffusion without sorting the draw calls.
-  float z = 1.0 - float(e.x) * (1.0 / 16.0);
-  gl_Position = vec4(px.x / u_res.x * 2.0 - 1.0, 1.0 - px.y / u_res.y * 2.0, z, 1.0);
-  v_layer = e.x;
+  vec2 world = tileOrigin(a_tileSlot) + vec2(a_pos) + vec2(float(ox), float(oy));
+  emitQuad(world, size, vec2(float(q & 1), float(q >> 1)), layer, 1.0);
 }`;
 
+// Mid: one quad per placement, the master's bounding box. Never touches the
+// rect table - outline w/h comes from the master table, which is resident.
+const VS_MID = `#version 300 es
+${COMMON}
+layout(location=0) in ivec2 a_pos;
+layout(location=1) in int   a_packed;
+layout(location=2) in int   a_tileSlot;
+
+void main() {
+  if (a_packed < 0) { discardVertex(); return; }
+  int m = a_packed & 0xffff;
+  int o = (a_packed >> 16) & 0xff;
+  ivec4 mi = fetchMaster(m * 2);
+  bool rot = (o == 2 || o == 3 || o == 6 || o == 7);
+  vec2 size = rot ? vec2(float(mi.w), float(mi.z)) : vec2(float(mi.z), float(mi.w));
+  if (max(size.x, size.y) * u_scale < u_minPx) { discardVertex(); return; }
+
+  int layer = classLayer(fetchMaster(m * 2 + 1).x);
+  if (layerHidden(layer)) { discardVertex(); return; }
+  vec2 corner = vec2(float(gl_VertexID & 1), float((gl_VertexID >> 1) & 1));
+  emitQuad(tileOrigin(a_tileSlot) + vec2(a_pos), size, corner, layer, 1.0);
+}`;
+
+// Far: pre-merged blocks that already carry their own size and density.
+const VS_FAR = `#version 300 es
+${COMMON}
+layout(location=0) in ivec2 a_pos;
+layout(location=1) in ivec2 a_size;
+layout(location=2) in float a_density;
+layout(location=3) in int   a_layer;
+layout(location=4) in int   a_tileSlot;
+
+void main() {
+  if (a_layer < 0) { discardVertex(); return; }
+  if (layerHidden(a_layer)) { discardVertex(); return; }
+  vec2 size = vec2(a_size);
+  if (max(size.x, size.y) * u_scale < u_minPx) { discardVertex(); return; }
+  vec2 corner = vec2(float(gl_VertexID & 1), float((gl_VertexID >> 1) & 1));
+  emitQuad(tileOrigin(a_tileSlot) + vec2(a_pos), size, corner, a_layer, a_density);
+}`;
+
+// Density modulates brightness, which is what turns a full-die view from
+// uniform grey into a readable map of where the design is dense.
 const FS = `#version 300 es
 precision mediump float;
 flat in int v_layer;
+in float v_density;
 uniform vec3 u_palette[16];
 out vec4 o_color;
-void main() { o_color = vec4(u_palette[v_layer], 1.0); }`;
+void main() {
+  o_color = vec4(u_palette[v_layer] * (0.22 + 0.78 * v_density), 1.0);
+}`;
+
+// Debug overlay: tile bounds and content boxes as line loops.
+const VS_LINES = `#version 300 es
+precision highp float;
+layout(location=0) in vec4 a_rect;    // dx, dy, w, h relative to the view origin
+layout(location=1) in float a_kind;   // 0 = tile bounds, 1 = content box
+uniform vec2 u_cam;
+uniform float u_scale;
+uniform vec2 u_res;
+flat out int v_kind;
+void main() {
+  vec2 c = gl_VertexID == 0 ? vec2(0.0, 0.0)
+         : gl_VertexID == 1 ? vec2(1.0, 0.0)
+         : gl_VertexID == 2 ? vec2(1.0, 1.0) : vec2(0.0, 1.0);
+  vec2 p = (a_rect.xy + c * a_rect.zw - u_cam) * u_scale + 0.5 * u_res;
+  gl_Position = vec4(p.x / u_res.x * 2.0 - 1.0, 1.0 - p.y / u_res.y * 2.0, -0.99, 1.0);
+  v_kind = int(a_kind + 0.5);
+}`;
+const FS_LINES = `#version 300 es
+precision mediump float;
+flat in int v_kind;
+out vec4 o_color;
+void main() {
+  o_color = v_kind == 0 ? vec4(0.25, 0.85, 0.95, 1.0) : vec4(0.95, 0.55, 0.20, 1.0);
+}`;
 
 function compile(gl, type, src) {
   const s = gl.createShader(type);
   gl.shaderSource(s, src);
   gl.compileShader(s);
-  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
-    throw new Error(gl.getShaderInfoLog(s) + '\n' + src);
-  }
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
   return s;
 }
 
+function link(gl, vs, fs, uniforms) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl, gl.VERTEX_SHADER, vs));
+  gl.attachShader(p, compile(gl, gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  const U = {};
+  for (const n of uniforms) U[n] = gl.getUniformLocation(p, n);
+  return { prog: p, U };
+}
+
+const QUAD_U = ['u_cam', 'u_scale', 'u_res', 'u_minPx', 'u_palette',
+                'u_masters', 'u_rects', 'u_tiles', 'u_layerMask', 'u_colorMode'];
+
 export class Renderer {
-  constructor(gl, masters) {
+  constructor(gl, masters, caps) {
     this.gl = gl;
     this.masters = masters;
+    // Shipped by the generator in manifest.bucketCaps. Deep tiles are sorted by
+    // the bucket these imply, so they are data, never a local constant.
+    this.caps = caps;
+    // Checked because it is the obvious alternative to bucketing, and it is not
+    // used: bucketing needs no extension, and it also fixes the *buffer* layout
+    // (one contiguous pool per bucket), which multi-draw on its own would not.
+    this.multiDraw = !!gl.getExtension('WEBGL_multi_draw');
 
-    const prog = gl.createProgram();
-    gl.attachShader(prog, compile(gl, gl.VERTEX_SHADER, VS));
-    gl.attachShader(prog, compile(gl, gl.FRAGMENT_SHADER, FS));
-    gl.linkProgram(prog);
-    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
-      throw new Error(gl.getProgramInfoLog(prog));
+    this.deep = link(gl, VS_DEEP, FS, QUAD_U);
+    this.mid  = link(gl, VS_MID, FS, QUAD_U);
+    this.far  = link(gl, VS_FAR, FS, QUAD_U);
+    this.lines = link(gl, VS_LINES, FS_LINES, ['u_cam', 'u_scale', 'u_res']);
+    for (const p of [this.deep, this.mid, this.far]) {
+      gl.useProgram(p.prog);
+      gl.uniform3fv(p.U.u_palette, PALETTE.flat());
+      gl.uniform1i(p.U.u_masters, 0);
+      gl.uniform1i(p.U.u_rects, 1);
+      gl.uniform1i(p.U.u_tiles, 2);
     }
-    this.prog = prog;
-    gl.useProgram(prog);
 
-    this.U = {};
-    for (const n of ['u_rects', 'u_rectBase', 'u_bbox', 'u_cam', 'u_scale',
-                     'u_res', 'u_minPx', 'u_palette']) {
-      this.U[n] = gl.getUniformLocation(prog, n);
-    }
-    gl.uniform3fv(this.U.u_palette, PALETTE.flat());
-    gl.uniform1i(this.U.u_rects, 0);
+    this.masterTex = this._intTexture(masters.masters, masters.masterCount * 2);
+    this.rectTex = this._intTexture(masters.rects, masters.rectCount * 2);
+    this._buildTileTexture();
 
-    this._buildRectTexture();
+    // one pool per bucket for deep, one for mid, one for far
+    this.deepPools = this.caps.map(() => new SlotPool(gl, PLACEMENT_SLOT_I32 * 4, 1 << 15));
+    this.midPool = new SlotPool(gl, PLACEMENT_SLOT_I32 * 4, 1 << 16);
+    this.farPool = new SlotPool(gl, BLOCK_SLOT_I32 * 4, 1 << 13);
+    this.deepVaos = this.deepPools.map(p => this._placementVao(p));
+    this.midVao = this._placementVao(this.midPool);
+    this.farVao = this._farVao(this.farPool);
 
-    this.vao = gl.createVertexArray();
-    gl.bindVertexArray(this.vao);
-    this.instBuf = gl.createBuffer();
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.instBuf);
-    gl.enableVertexAttribArray(0);
-    gl.enableVertexAttribArray(1);
-    gl.vertexAttribDivisor(0, 1);
-    gl.vertexAttribDivisor(1, 1);
+    this.lineBuf = gl.createBuffer();
+    this.lineVao = gl.createVertexArray();
+    gl.bindVertexArray(this.lineVao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.lineBuf);
+    gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 4, gl.FLOAT, false, 20, 0); gl.vertexAttribDivisor(0, 1);
+    gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 1, gl.FLOAT, false, 20, 16); gl.vertexAttribDivisor(1, 1);
+    gl.bindVertexArray(null);
 
     gl.enable(gl.DEPTH_TEST);
     gl.depthFunc(gl.LEQUAL);
     gl.clearColor(0.055, 0.055, 0.065, 1);
     gl.clearDepth(1.0);
 
-    // View origin for the f32 delta trick, plus the staging buffer.
+    // resident tile bookkeeping
     this.originX = 0;
     this.originY = 0;
-    this.staging = new Float32Array(0);
-    this.batches = [];        // { master, first, count, rects }
+    this.kind = TILE_KIND.FAR;
+    this.resident = new Map();          // key -> { tile, tileSlot, allocs }
+    this.freeTileSlots = [];
+    for (let i = MAX_TILE_SLOTS - 1; i >= 0; i--) this.freeTileSlots.push(i);
+    this.tileOrigins = new Float32Array(MAX_TILE_SLOTS * 4);
+
+    this.scratch = new Int32Array(1 << 16);
+    this.layerMask = 0xffff;
+    this.colorMode = 0;
+    this.showTiles = false;
+    this.minPx = 0;
+
+    // stats
     this.instanceCount = 0;
     this.rectCount = 0;
-    this.rebuilds = 0;
-    this.lastRebuildMs = 0;
+    this.submittedRects = 0;
+    this.distinctMasters = 0;
+    this.drawCalls = 0;
+    this.updateMs = 0;
+    this.updateWorstMs = 0;
+    this.updates = 0;
+    this.lastAdded = 0;
+    this.lastRemoved = 0;
+    // Per-master reference counts, so the distinct-master figure is maintained
+    // as tiles come and go. Recounting every placement on each tile arrival
+    // would cost more than loading the tile.
+    this._refs = new Int32Array(masters.masterCount);
   }
 
-  // masters.bin's rect table goes to the GPU untouched apart from padding the
-  // last texture row: 8 int32 per rect == 2 RGBA32I texels.
-  _buildRectTexture() {
+  // masters.bin's tables go to the GPU untouched apart from padding the last
+  // texture row: 8 int32 per record == 2 RGBA32I texels.
+  _intTexture(src, texels) {
     const gl = this.gl;
-    const texels = this.masters.rectCount * 2;
     const rows = Math.max(1, Math.ceil(texels / RECT_TEX_WIDTH));
     const padded = new Int32Array(RECT_TEX_WIDTH * rows * 4);
-    padded.set(this.masters.rects);
-
+    padded.set(src);
     const tex = gl.createTexture();
-    gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, tex);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
@@ -177,123 +334,286 @@ export class Renderer {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32I, RECT_TEX_WIDTH, rows, 0,
                   gl.RGBA_INTEGER, gl.INT, padded);
-    this.rectTex = tex;
-    this.rectTexBytes = padded.byteLength;
+    return { tex, bytes: padded.byteLength, rows };
   }
 
-  // Should the origin be re-snapped? Once the camera has drifted far enough
-  // that the f32 deltas would start losing subpixel precision, resnap.
+  _buildTileTexture() {
+    const gl = this.gl;
+    const rows = MAX_TILE_SLOTS / TILE_TEX_WIDTH;
+    const tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, TILE_TEX_WIDTH, rows, 0,
+                  gl.RGBA, gl.FLOAT, new Float32Array(MAX_TILE_SLOTS * 4));
+    this.tileTex = tex;
+    this.tileTexRows = rows;
+  }
+
+  _placementVao(pool) {
+    const gl = this.gl;
+    const vao = gl.createVertexArray();
+    gl.bindVertexArray(vao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, pool.buf);
+    const s = PLACEMENT_SLOT_I32 * 4;
+    gl.enableVertexAttribArray(0); gl.vertexAttribIPointer(0, 2, gl.INT, s, 0);  gl.vertexAttribDivisor(0, 1);
+    gl.enableVertexAttribArray(1); gl.vertexAttribIPointer(1, 1, gl.INT, s, 8);  gl.vertexAttribDivisor(1, 1);
+    gl.enableVertexAttribArray(2); gl.vertexAttribIPointer(2, 1, gl.INT, s, 12); gl.vertexAttribDivisor(2, 1);
+    gl.bindVertexArray(null);
+    return { vao, generation: pool.generation || 0 };
+  }
+
+  _farVao(pool) {
+    const gl = this.gl;
+    const vao = gl.createVertexArray();
+    gl.bindVertexArray(vao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, pool.buf);
+    const s = BLOCK_SLOT_I32 * 4;
+    gl.enableVertexAttribArray(0); gl.vertexAttribIPointer(0, 2, gl.INT, s, 0);  gl.vertexAttribDivisor(0, 1);
+    gl.enableVertexAttribArray(1); gl.vertexAttribIPointer(1, 2, gl.INT, s, 8);  gl.vertexAttribDivisor(1, 1);
+    gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2, 1, gl.FLOAT, false, s, 16); gl.vertexAttribDivisor(2, 1);
+    gl.enableVertexAttribArray(3); gl.vertexAttribIPointer(3, 1, gl.INT, s, 20); gl.vertexAttribDivisor(3, 1);
+    gl.enableVertexAttribArray(4); gl.vertexAttribIPointer(4, 1, gl.INT, s, 28); gl.vertexAttribDivisor(4, 1);
+    gl.bindVertexArray(null);
+    return { vao, generation: pool.generation || 0 };
+  }
+
+  // A pool that grew has a new buffer object, so its VAO must re-point.
+  _syncVao(entry, pool, isFar) {
+    if ((pool.generation || 0) === entry.generation) return entry;
+    this.gl.deleteVertexArray(entry.vao);
+    const next = isFar ? this._farVao(pool) : this._placementVao(pool);
+    entry.vao = next.vao;
+    entry.generation = next.generation;
+    return entry;
+  }
+
   needsResnap(cam) {
     const drift = Math.max(Math.abs(cam.x - this.originX), Math.abs(cam.y - this.originY));
     return drift * cam.scale > 1e6;
   }
 
-  // Rebuild the staging buffer from a list of loaded instance tiles. Instances
-  // are concatenated grouped by master so each master needs exactly one draw
-  // call regardless of how many tiles contribute to it.
-  setVisible(tiles, cam) {
-    const t0 = performance.now();
-    const gl = this.gl;
-    const nM = this.masters.masterCount;
-    const md = this.masters.masters;
-
-    this.originX = cam.x;
-    this.originY = cam.y;
-
-    let total = 0, rectTotal = 0;
-    const totals = new Int32Array(nM + 1);
-    for (const t of tiles) {
-      for (let g = 0; g < t.groupCount; g++) {
-        const b = g * G_STRIDE;
-        totals[t.groups[b + G_MASTER] + 1] += t.groups[b + G_COUNT];
-      }
-      total += t.count;
-      rectTotal += t.rectCount;
-    }
-    for (let m = 0; m < nM; m++) totals[m + 1] += totals[m];
-
-    if (this.staging.length < total * 3) {
-      this.staging = new Float32Array(Math.ceil(total * 1.25) * 3);
-    }
-    const st = this.staging;
-    const cursor = totals.slice(0, nM);
-
-    const batches = [];
-    for (let m = 0; m < nM; m++) {
-      const c = totals[m + 1] - totals[m];
-      if (c === 0) continue;
-      batches.push({
-        master: m,
-        first: totals[m],
-        count: c,
-        rectBase: md[m * M_STRIDE + M_RECT_START],
-        rects: md[m * M_STRIDE + M_RECT_COUNT],
-        w: md[m * M_STRIDE + M_W],
-        h: md[m * M_STRIDE + M_H],
-      });
-    }
-
-    for (const t of tiles) {
-      // f64 subtraction happens here, once per instance, and only the small
-      // difference is narrowed to f32.
-      const dx = t.originX - this.originX;
-      const dy = t.originY - this.originY;
-      const inst = t.inst;
-      for (let g = 0; g < t.groupCount; g++) {
-        const b = g * G_STRIDE;
-        const m = t.groups[b + G_MASTER];
-        const s = t.groups[b + G_START];
-        const c = t.groups[b + G_COUNT];
-        let w = cursor[m] * 3;
-        cursor[m] += c;
-        for (let i = s, end = s + c; i < end; i++) {
-          const p = i * I_STRIDE;
-          st[w    ] = dx + inst[p];
-          st[w + 1] = dy + inst[p + 1];
-          st[w + 2] = (inst[p + 2] >>> 16) & 0xff;
-          w += 3;
-        }
-      }
-    }
-
-    gl.bindVertexArray(this.vao);
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.instBuf);
-    gl.bufferData(gl.ARRAY_BUFFER, st.subarray(0, total * 3), gl.DYNAMIC_DRAW);
-
-    this.batches = batches;
-    this.instanceCount = total;
-    this.rectCount = rectTotal;
-    this.rebuilds++;
-    this.lastRebuildMs = performance.now() - t0;
+  _scratchFor(i32) {
+    if (this.scratch.length < i32) this.scratch = new Int32Array(Math.ceil(i32 * 1.25));
+    return this.scratch;
   }
 
-  draw(cam, minPx) {
+  // ------------------------------------------------------------ residency
+  // Entering and leaving tiles touch only their own slots.
+
+  _addTile(key, tile) {
+    const tileSlot = this.freeTileSlots.pop();
+    if (tileSlot === undefined) return false;
+    const allocs = [];
+
+    if (tile.kind === TILE_KIND.FAR) {
+      const n = tile.count;
+      const out = this._scratchFor(n * BLOCK_SLOT_I32);
+      buildBlockSlots(tile, tileSlot, out);
+      const off = this.farPool.alloc(n);
+      this.farPool.write(off, out.subarray(0, n * BLOCK_SLOT_I32));
+      allocs.push({ pool: this.farPool, off, n, far: true });
+    } else if (tile.kind === TILE_KIND.MID) {
+      const n = tile.count;
+      const out = this._scratchFor(n * PLACEMENT_SLOT_I32);
+      buildPlacementSlots(tile, 0, n, tileSlot, out);
+      const off = this.midPool.alloc(n);
+      this.midPool.write(off, out.subarray(0, n * PLACEMENT_SLOT_I32));
+      allocs.push({ pool: this.midPool, off, n });
+    } else {
+      for (const b of tileBuckets(tile)) {
+        const out = this._scratchFor(b.count * PLACEMENT_SLOT_I32);
+        buildPlacementSlots(tile, b.start, b.count, tileSlot, out);
+        const pool = this.deepPools[b.bucket];
+        const off = pool.alloc(b.count);
+        pool.write(off, out.subarray(0, b.count * PLACEMENT_SLOT_I32));
+        allocs.push({ pool, off, n: b.count });
+      }
+    }
+
+    this.resident.set(key, { tile, tileSlot, allocs });
+    this.tileOrigins[tileSlot * 4] = tile.originX - this.originX;
+    this.tileOrigins[tileSlot * 4 + 1] = tile.originY - this.originY;
+    this._account(tile, 1);
+    return true;
+  }
+
+  _removeTile(key) {
+    const r = this.resident.get(key);
+    if (!r) return;
+    for (const a of r.allocs) {
+      const words = a.far ? BLOCK_SLOT_I32 : PLACEMENT_SLOT_I32;
+      const out = this._scratchFor(a.n * words);
+      if (a.far) fillFreeBlocks(out, a.n); else fillFreePlacements(out, a.n);
+      a.pool.write(a.off, out.subarray(0, a.n * words));
+      a.pool.release(a.off, a.n);
+    }
+    this._account(r.tile, -1);
+    this.freeTileSlots.push(r.tileSlot);
+    this.resident.delete(key);
+  }
+
+  // Fold one tile into (sign +1) or out of (sign -1) the running totals.
+  _account(t, sign) {
+    this.instanceCount += sign * t.count;
+    this.rectCount += sign * t.rectCount;
+    if (t.kind === TILE_KIND.FAR) { this.submittedRects += sign * t.count; return; }
+    if (t.kind === TILE_KIND.MID) this.submittedRects += sign * t.count;
+    else for (const b of tileBuckets(t)) this.submittedRects += sign * b.count * this.caps[b.bucket];
+    const refs = this._refs;
+    for (let i = 0; i < t.count; i++) {
+      const m = t.inst[i * I_STRIDE + 2] & 0xffff;
+      const before = refs[m];
+      refs[m] = before + sign;
+      if (sign > 0 && before === 0) this.distinctMasters++;
+      else if (sign < 0 && before === 1) this.distinctMasters--;
+    }
+  }
+
+  // Reconcile the resident set with what should be visible. `wanted` is a Map
+  // of key -> tile view, all of the same kind.
+  setVisible(wanted, cam) {
+    const t0 = performance.now();
+    const resnap = this.needsResnap(cam) || this.resident.size === 0;
+    if (resnap) { this.originX = cam.x; this.originY = cam.y; }
+
+    let kind = this.kind;
+    for (const t of wanted.values()) { kind = t.kind; break; }
+    const kindChanged = kind !== this.kind;
+    this.kind = kind;
+
+    let removed = 0;
+    for (const key of [...this.resident.keys()]) {
+      if (kindChanged || !wanted.has(key)) { this._removeTile(key); removed++; }
+    }
+    let added = 0;
+    for (const [key, tile] of wanted) {
+      if (this.resident.has(key)) continue;
+      if (this._addTile(key, tile)) added++;
+    }
+
+    // Only the per-tile origin table depends on the view origin, and it is a
+    // few kilobytes. Nothing in the slot buffers is origin-relative.
+    if (resnap) {
+      for (const r of this.resident.values()) {
+        this.tileOrigins[r.tileSlot * 4] = r.tile.originX - this.originX;
+        this.tileOrigins[r.tileSlot * 4 + 1] = r.tile.originY - this.originY;
+      }
+    }
+    this._uploadTileOrigins();
+
+    this.updates++;
+    this.lastAdded = added;
+    this.lastRemoved = removed;
+    this.updateMs = performance.now() - t0;
+    if (this.updateMs > this.updateWorstMs) this.updateWorstMs = this.updateMs;
+    return { added, resnap };
+  }
+
+  _uploadTileOrigins() {
+    const gl = this.gl;
+    gl.bindTexture(gl.TEXTURE_2D, this.tileTex);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, TILE_TEX_WIDTH, this.tileTexRows,
+                     gl.RGBA, gl.FLOAT, this.tileOrigins);
+  }
+
+  get pools() {
+    return this.kind === TILE_KIND.DEEP ? this.deepPools
+         : this.kind === TILE_KIND.MID ? [this.midPool] : [this.farPool];
+  }
+
+  get poolBytes() {
+    let b = 0;
+    for (const p of [...this.deepPools, this.midPool, this.farPool]) b += p.bytes;
+    return b;
+  }
+
+  get waste() {
+    let hw = 0, used = 0;
+    for (const p of this.pools) { hw += p.highWater; used += p.used; }
+    return hw === 0 ? 0 : 1 - used / hw;
+  }
+
+  // ------------------------------------------------------------ draw
+  draw(cam) {
     const gl = this.gl;
     gl.viewport(0, 0, cam.resW, cam.resH);
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-    if (this.batches.length === 0) return 0;
 
-    gl.useProgram(this.prog);
-    gl.bindVertexArray(this.vao);
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.instBuf);
-    gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, this.rectTex);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, this.masterTex.tex);
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, this.rectTex.tex);
+    gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, this.tileTex);
 
-    gl.uniform2f(this.U.u_cam, cam.x - this.originX, cam.y - this.originY);
-    gl.uniform1f(this.U.u_scale, cam.scale);
-    gl.uniform2f(this.U.u_res, cam.resW, cam.resH);
-    gl.uniform1f(this.U.u_minPx, minPx);
+    const camX = cam.x - this.originX, camY = cam.y - this.originY;
+    const setup = p => {
+      gl.useProgram(p.prog);
+      gl.uniform2f(p.U.u_cam, camX, camY);
+      gl.uniform1f(p.U.u_scale, cam.scale);
+      gl.uniform2f(p.U.u_res, cam.resW, cam.resH);
+      gl.uniform1f(p.U.u_minPx, this.minPx);
+      gl.uniform1i(p.U.u_layerMask, this.layerMask);
+      gl.uniform1i(p.U.u_colorMode, this.colorMode);
+    };
 
     let calls = 0;
-    for (const b of this.batches) {
-      const off = b.first * 12;
-      gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 12, off);
-      gl.vertexAttribPointer(1, 1, gl.FLOAT, false, 12, off + 8);
-      gl.uniform1i(this.U.u_rectBase, b.rectBase);
-      gl.uniform2i(this.U.u_bbox, b.w, b.h);
-      gl.drawArraysInstanced(gl.TRIANGLES, 0, b.rects * 6, b.count);
+    if (this.kind === TILE_KIND.DEEP) {
+      setup(this.deep);
+      for (let b = 0; b < this.deepPools.length; b++) {
+        const pool = this.deepPools[b];
+        if (pool.highWater === 0) continue;
+        const entry = this._syncVao(this.deepVaos[b], pool, false);
+        gl.bindVertexArray(entry.vao);
+        gl.drawArraysInstanced(gl.TRIANGLES, 0, this.caps[b] * 6, pool.highWater);
+        calls++;
+      }
+    } else if (this.kind === TILE_KIND.MID) {
+      if (this.midPool.highWater > 0) {
+        setup(this.mid);
+        const entry = this._syncVao(this.midVao, this.midPool, false);
+        gl.bindVertexArray(entry.vao);
+        gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, this.midPool.highWater);
+        calls++;
+      }
+    } else if (this.farPool.highWater > 0) {
+      setup(this.far);
+      const entry = this._syncVao(this.farVao, this.farPool, true);
+      gl.bindVertexArray(entry.vao);
+      gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, this.farPool.highWater);
       calls++;
     }
+
+    if (this.showTiles) calls += this._drawTileBounds(cam, camX, camY);
+
+    gl.bindVertexArray(null);
+    this.drawCalls = calls;
     return calls;
+  }
+
+  _drawTileBounds(cam, camX, camY) {
+    const gl = this.gl;
+    const n = this.resident.size;
+    if (n === 0) return 0;
+    const data = new Float32Array(n * 2 * 5);
+    let w = 0;
+    for (const r of this.resident.values()) {
+      const t = r.tile;
+      const dx = t.originX - this.originX, dy = t.originY - this.originY;
+      data[w] = dx; data[w + 1] = dy; data[w + 2] = t.tileSize; data[w + 3] = t.tileSize;
+      data[w + 4] = 0; w += 5;
+      data[w] = dx + t.minX; data[w + 1] = dy + t.minY;
+      data[w + 2] = t.maxX - t.minX; data[w + 3] = t.maxY - t.minY;
+      data[w + 4] = 1; w += 5;
+    }
+    gl.bindVertexArray(this.lineVao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.lineBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, data, gl.DYNAMIC_DRAW);
+    gl.useProgram(this.lines.prog);
+    gl.uniform2f(this.lines.U.u_cam, camX, camY);
+    gl.uniform1f(this.lines.U.u_scale, cam.scale);
+    gl.uniform2f(this.lines.U.u_res, cam.resW, cam.resH);
+    gl.drawArraysInstanced(gl.LINE_LOOP, 0, 4, n * 2);
+    return 1;
   }
 }

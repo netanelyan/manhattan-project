@@ -30,6 +30,13 @@ http.createServer((req, res) => {
     res.writeHead(400).end('bad url');
     return;
   }
+  // Scripted-measurement sink: the viewer's ?bench mode posts its numbers here
+  // so a headless run can report them without depending on screenshot timing.
+  if (rel === '/__log') {
+    console.log(new URL(req.url, 'http://x').searchParams.get('msg') || '');
+    res.writeHead(204).end();
+    return;
+  }
   if (rel.endsWith('/')) rel += 'index.html';
   const file = path.join(ROOT, rel);
   if (!file.startsWith(ROOT + path.sep) && file !== ROOT) {

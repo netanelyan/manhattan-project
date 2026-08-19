@@ -17,13 +17,54 @@ semiconductor world.
 No dependencies, no build step. Node for the generator, a browser for the viewer.
 
 ```sh
-node tools/gen.js --count 500k --one-tile   # write data/ (~0.3s)
-node tools/verify.js data                   # check the binaries round-trip
-node tools/serve.js                         # http://localhost:8080/src/
+node tools/gen.js --count 500k   # write data/ (0.2s, 341 tiles, 18.5 MB)
+node tools/verify.js data        # check every invariant the viewer relies on
+node tools/bench.js data         # time the staging rebuild
+node tools/serve.js              # http://localhost:8080/src/
 ```
 
-`--count` accepts 100k to 50M (`500k`, `1.5M`). Generating 50M placements takes
-about 7s. Drag to pan, wheel to zoom, `f` to fit, `p` to toggle subpixel skip.
+`--count` accepts 100k to 50M (`500k`, `1.5M`). 500k takes 0.3s and 17.5 MB; 5M
+takes 3.4s and 176 MB; a 50M design runs to about 1.2 GB, so check your disk
+before asking for one. The master library is 4,634 cells, matching a real
+`cells.lef`.
+
+Viewer keys:
+
+| key | |
+|---|---|
+| drag / wheel | pan, zoom |
+| `[` `]` | LOD level down / up |
+| `f` | fit the die |
+| `1`-`9` | toggle a layer |
+| `a` | all layers on / off |
+| `c` | colour by layer or by cell class |
+| `t` | tile bounds and content boxes overlay |
+| `p` | subpixel skip |
+| `r` | reset the worst-update timer |
+| `-` `=` | halve / double the tile cache budget |
+
+## LOD
+
+The pyramid does not decimate, it changes representation - dropping small cells
+would leave holes in cells still large enough to see. Each level carries one of
+three forms, chosen by the generator from the rectangle budget and how many
+pixels a cell covers:
+
+| | what a tile holds | rects per placement | draw calls |
+|---|---|---|---|
+| **deep** | full master internals | ~11 | one per rect-count bucket (4) |
+| **mid** | one cell outline per placement | 1 | one |
+| **far** | merged density blocks, macros and power grid | n/a | one |
+
+Two things keep those numbers flat as designs grow. Deep draws group by
+*rect-count bucket*, not by master, so the draw count does not track library
+size - grouping by master needed ~4,400 calls per frame at 4,634 masters.
+And features too big for a level's tiles are promoted to a per-level overflow
+list, so content bleed stays at one standard cell instead of one macro, which
+otherwise inflated the tiles fetched per frame by up to 50x.
+
+Full byte layouts, the level assignment rule, and the measurements behind both
+are in [docs/tile-format.md](docs/tile-format.md).
 
 ## Layout
 
@@ -31,10 +72,15 @@ about 7s. Drag to pan, wheel to zoom, `f` to fit, `p` to toggle subpixel skip.
 |---|---|
 | `tools/gen.js` | tile generator CLI |
 | `tools/layout.js` | synthetic layout: master library, density field, placement |
+| `tools/pyramid.js` | level planning, bucketing, the three tile builders |
 | `tools/format.js` | binary layout constants shared with the docs |
 | `tools/verify.js` | reads the binaries back and checks every viewer invariant |
+| `tools/bench.js` | times the staging rebuild on real tiles, outside the browser |
 | `tools/serve.js` | static file server, core Node only |
 | `src/` | the viewer: plain ES modules, WebGL2, no framework |
+| `src/slots.js` | the hot path: one tile to its GPU slot records |
+| `src/tiles.js` | prioritised fetch queue and LRU cache |
+| `src/pool.js` | persistent GPU slot buffer with a free list |
 | `spike/stress.html` | completed throughput experiment, frozen |
 
 ## Findings

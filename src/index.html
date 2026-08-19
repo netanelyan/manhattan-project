@@ -17,6 +17,19 @@
 <body>
 <canvas id="c"></canvas>
 <div id="hud">loading...</div>
+<script>
+  // Module-level failures are otherwise silent: the page just sits at
+  // "loading..." with nothing in the DOM to say why.
+  addEventListener('error', function (e) {
+    document.getElementById('hud').textContent =
+      'error: ' + (e.message || e) + ' @ ' + (e.filename || '') + ':' + (e.lineno || '');
+  });
+  addEventListener('unhandledrejection', function (e) {
+    var r = e.reason;
+    document.getElementById('hud').textContent =
+      'unhandled rejection: ' + ((r && r.message) || r) + ' ' + ((r && r.stack) || '');
+  });
+</script>
 <script type="module" src="./main.js"></script>
 </body>
 </html>
