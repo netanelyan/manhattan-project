@@ -38,8 +38,11 @@ const L = {
   VIA1: 6, METAL2: 7, METAL3: 8, PIN: 9, MACRO: 10, PWR: 11,
 };
 
-// Cell master classes.
-const K = { STD: 0, MACRO: 1, PWR: 2 };
+// Cell master classes. Filler and decap are their own class rather than
+// standard cells with a flag: they are the difference between area that is
+// occupied and area that is doing something, which is the first question a
+// full-die view has to answer.
+const K = { STD: 0, MACRO: 1, PWR: 2, FILL: 3 };
 
 // LEF orientations.
 const O = { N: 0, S: 1, W: 2, E: 3, FN: 4, FS: 5, FW: 6, FE: 7 };
@@ -177,7 +180,7 @@ function buildFiller(rects, w, decap) {
   }
   return {
     rectStart: start, rectCount: rects.length / 8 - start,
-    w, h, klass: K.STD, rowH: ROW_H,
+    w, h, klass: K.FILL, rowH: ROW_H,
   };
 }
 
@@ -245,6 +248,10 @@ function generate(opts) {
   // --- die size, solved analytically from meanW and the mean density.
   // Each fill step advances by one master width whether or not it places, so
   // expected cells = (dieArea / (meanW * ROW_H)) * meanDensity.
+  //
+  // NOTE: this models leftover space as empty. A real design fills it with
+  // filler and decap, which is why the far tile carries a filler channel the
+  // synthetic data barely exercises - see docs/tile-format.md, "Dead area".
   const density = makeDensityField(rand, opts.densityLo, opts.densityHi);
   const stdTarget = opts.count;
   const dieArea = (stdTarget * meanW * ROW_H / density.mean) / (1 - MACRO_AREA_FRAC);
@@ -313,7 +320,11 @@ function generate(opts) {
   const im = new Uint16Array(capacity);
   const io = new Uint8Array(capacity);
   let n = 0;
-  const emit = (m, x, y, o) => { ix[n] = x; iy[n] = y; im[n] = m; io[n] = o; n++; };
+  let fillPlaced = 0;
+  const emit = (m, x, y, o) => {
+    ix[n] = x; iy[n] = y; im[n] = m; io[n] = o; n++;
+    if (masters[m].klass === K.FILL) fillPlaced++;
+  };
 
   for (const m of macros) emit(m.master, m.x, m.y, O.N);
   const macroCount = n;
@@ -371,6 +382,7 @@ function generate(opts) {
     maxZ, tilesPerSide, tileSize, worldSize,
     macroCount, pwrCount,
     stdCount: n - macroCount - pwrCount,
+    fillCount: fillPlaced,
     densityMean: density.mean,
     meanW, meanRects, rectHist,
     strapAligned: aligned, strapSeg: PWR_SEG,

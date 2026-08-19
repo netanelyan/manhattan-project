@@ -44,10 +44,20 @@ const PALETTE = [
   [0.85, 0.85, 0.85], [0.24, 0.44, 0.72], [0.81, 0.81, 0.38], [0.72, 0.40, 0.24],
   [0.48, 0.31, 0.72], [0.88, 0.75, 0.25], [0.29, 0.29, 0.35], [0.78, 0.31, 0.24],
   [0.34, 0.52, 0.74], [0.40, 0.38, 0.50], [0.82, 0.34, 0.26], [0, 0, 0],
+  // 16 + klass: colour by cell class. The depth key still uses the abstract
+  // layer, so colour and ordering are separate - which is what lets filler have
+  // its own colour without floating above the power grid.
+  [0.34, 0.52, 0.74],   // standard cell
+  [0.40, 0.38, 0.50],   // macro
+  [0.82, 0.34, 0.26],   // power
+  [0.28, 0.27, 0.31],   // filler / decap: occupied, not doing anything
 ];
+const CLASS_NAMES = ['cell', 'macro', 'power', 'filler'];
+const PALETTE_SIZE = 20;
 
 // Keys 1-9 toggle these layers: the ones worth hiding while reading a layout.
 export const TOGGLE_LAYERS = [2, 3, 4, 5, 6, 7, 8, 9, 11];
+export const CLASS_LAYER_NAMES = CLASS_NAMES;
 
 const MAX_TILE_SLOTS = 1024;      // resident tiles addressable by the origin table
 const MAX_TILE_ENTRIES = 4096;    // (instance, tile) pairs the table can hold
@@ -75,9 +85,14 @@ uniform vec4  u_rot;                  // block orientation, column-major mat2
 uniform float u_minPx;
 uniform int   u_layerMask;
 uniform int   u_colorMode;            // 0 = by layer, 1 = by class
+uniform float u_layerAlpha[16];       // per layer, 1.0 = opaque
+uniform vec2  u_dens;                 // logic density p5..p95, for the ramp
 
-flat out int v_layer;
+flat out int v_ci;                    // palette index
+flat out int v_mode;                  // 0 = flat colour, 1 = density ramp
 out float v_density;
+out float v_fill;
+out float v_alpha;
 
 ivec4 fetchMaster(int i) {
   return texelFetch(u_masters, ivec2(i & ${RECT_TEX_WIDTH - 1}, i >> ${LOG2_TEXW}), 0);
@@ -104,12 +119,12 @@ int classLayer(int klass) {
 }
 // Tile-local coordinates are rotated into the instance's orientation; the tile
 // origin is already transformed, on the CPU, in f64.
-void emitQuad(vec2 origin, vec2 local, vec2 size, vec2 corner, int layer, float density) {
+// depthLayer is the layer id used as the depth key; colour comes from v_ci,
+// set by the caller, so colouring by class cannot disturb painting order.
+void emitQuad(vec2 origin, vec2 local, vec2 size, vec2 corner, int depthLayer) {
   vec2 p = (origin + blockRot(local + corner * size) - u_cam) * u_scale + 0.5 * u_res;
-  float z = 1.0 - float(layer) * (1.0 / 16.0);
+  float z = 1.0 - float(depthLayer) * (1.0 / 16.0);
   gl_Position = vec4(p.x / u_res.x * 2.0 - 1.0, 1.0 - p.y / u_res.y * 2.0, z, 1.0);
-  v_layer = layer;
-  v_density = density;
 }
 void discardVertex() { gl_Position = vec4(0.0, 0.0, 0.0, -1.0); }
 `;
@@ -157,10 +172,13 @@ void main() {
   vec2 size = vec2(float(ow), float(oh));
   if (max(size.x, size.y) * u_scale < u_minPx) { discardVertex(); return; }
 
-  int layer = u_colorMode == 1 ? classLayer(fetchMaster(m * 2 + 1).x) : e.x;
+  int layer = e.x, ci = e.x;
+  if (u_colorMode == 1) { int k = fetchMaster(m * 2 + 1).x; layer = classLayer(k); ci = 16 + k; }
+  v_ci = ci; v_mode = 0; v_density = 1.0; v_fill = 0.0;
+  v_alpha = u_layerAlpha[e.x];          // alpha follows the real layer, not the class
   int q = QI[gl_VertexID % 6];
   vec2 local = vec2(a_pos) + vec2(float(ox), float(oy));
-  emitQuad(tinfo.xy, local, size, vec2(float(q & 1), float(q >> 1)), layer, 1.0);
+  emitQuad(tinfo.xy, local, size, vec2(float(q & 1), float(q >> 1)), layer);
 }`;
 
 // Mid: one quad per placement, the master's bounding box. Never touches the
@@ -182,10 +200,14 @@ void main() {
   vec2 size = rot ? vec2(float(mi.w), float(mi.z)) : vec2(float(mi.z), float(mi.w));
   if (max(size.x, size.y) * u_scale < u_minPx) { discardVertex(); return; }
 
-  int layer = classLayer(fetchMaster(m * 2 + 1).x);
+  int k = fetchMaster(m * 2 + 1).x;
+  int layer = classLayer(k);
   if (layerHidden(layer)) { discardVertex(); return; }
+  v_ci = u_colorMode == 1 ? 16 + k : layer;
+  v_mode = 0; v_density = 1.0; v_fill = 0.0;
+  v_alpha = u_layerAlpha[layer];
   vec2 corner = vec2(float(gl_VertexID & 1), float((gl_VertexID >> 1) & 1));
-  emitQuad(tinfo.xy, vec2(a_pos), size, corner, layer, 1.0);
+  emitQuad(tinfo.xy, vec2(a_pos), size, corner, layer);
 }`;
 
 // Far: pre-merged blocks that already carry their own size and density.
@@ -193,9 +215,10 @@ const VS_FAR = `#version 300 es
 ${COMMON}
 layout(location=0) in ivec2 a_pos;
 layout(location=1) in ivec2 a_size;
-layout(location=2) in float a_density;
+layout(location=2) in float a_density;    // logic area fraction
 layout(location=3) in int   a_layer;
 layout(location=4) in int   a_tileSlot;
+layout(location=5) in float a_fill;       // filler area fraction
 
 void main() {
   if (a_layer < 0) { discardVertex(); return; }
@@ -204,20 +227,64 @@ void main() {
   if (tinfo.z < 0.0) { discardVertex(); return; }
   vec2 size = vec2(a_size);
   if (max(size.x, size.y) * u_scale < u_minPx) { discardVertex(); return; }
+  // A density block is coloured by what it holds, not by a palette entry: that
+  // is the whole content of a far tile. Macros and the power grid stay flat and
+  // sharp on top of it.
+  v_mode = a_layer == ${LAYER_CELLBOX} ? 1 : 0;
+  v_ci = u_colorMode == 1
+       ? (a_layer == ${LAYER_MACROBOX} ? 17 : a_layer == ${LAYER_POWERBOX} ? 18 : 16)
+       : a_layer;
+  v_density = a_density;
+  v_fill = a_fill;
+  v_alpha = u_layerAlpha[a_layer];
   vec2 corner = vec2(float(gl_VertexID & 1), float((gl_VertexID >> 1) & 1));
-  emitQuad(tinfo.xy, vec2(a_pos), size, corner, a_layer, a_density);
+  emitQuad(tinfo.xy, vec2(a_pos), size, corner, a_layer);
 }`;
 
-// Density modulates brightness, which is what turns a full-die view from
-// uniform grey into a readable map of where the design is dense.
+// The full-die view lives or dies here.
+//
+// A single hue scaled by density is the grey mud the spike ran into: a design
+// that runs 40-95% full spends its whole range in the top half of one ramp, and
+// every region ends up the same colour. Two things fix it. The ramp walks hue
+// as well as lightness, and it is stretched across the design's actual p5..p95
+// logic density rather than [0, 1]. Then dead area is pulled out of the ramp
+// entirely - a block packed with decaps is occupied but doing nothing, and
+// showing it as "dense" is worse than not showing density at all.
 const FS = `#version 300 es
 precision mediump float;
-flat in int v_layer;
+flat in int v_ci;
+flat in int v_mode;
 in float v_density;
-uniform vec3 u_palette[16];
+in float v_fill;
+in float v_alpha;
+uniform vec3 u_palette[${PALETTE_SIZE}];
+uniform vec2 u_dens;
 out vec4 o_color;
+
+vec3 ramp(float t) {
+  vec3 c0 = vec3(0.10, 0.14, 0.32);   // sparse
+  vec3 c1 = vec3(0.13, 0.45, 0.56);
+  vec3 c2 = vec3(0.42, 0.70, 0.36);
+  vec3 c3 = vec3(0.88, 0.78, 0.32);
+  vec3 c4 = vec3(0.90, 0.42, 0.22);   // packed
+  if (t < 0.25) return mix(c0, c1, t * 4.0);
+  if (t < 0.50) return mix(c1, c2, (t - 0.25) * 4.0);
+  if (t < 0.75) return mix(c2, c3, (t - 0.50) * 4.0);
+  return mix(c3, c4, (t - 0.75) * 4.0);
+}
+
 void main() {
-  o_color = vec4(u_palette[v_layer] * (0.22 + 0.78 * v_density), 1.0);
+  vec3 c;
+  if (v_mode == 1) {
+    float t = clamp((v_density - u_dens.x) / max(1e-4, u_dens.y - u_dens.x), 0.0, 1.0);
+    c = ramp(t);
+    float occupied = v_density + v_fill;
+    float dead = occupied > 1e-4 ? v_fill / occupied : 0.0;
+    c = mix(c, vec3(0.30, 0.29, 0.34), smoothstep(0.45, 0.90, dead));
+  } else {
+    c = u_palette[v_ci];
+  }
+  o_color = vec4(c, v_alpha);
 }`;
 
 // Debug overlay: tile bounds and content boxes as line loops.
@@ -242,7 +309,9 @@ precision mediump float;
 flat in int v_kind;
 out vec4 o_color;
 void main() {
-  o_color = v_kind == 0 ? vec4(0.25, 0.85, 0.95, 1.0) : vec4(0.95, 0.55, 0.20, 1.0);
+  o_color = v_kind == 0 ? vec4(0.25, 0.85, 0.95, 1.0)
+          : v_kind == 1 ? vec4(0.95, 0.55, 0.20, 1.0)
+                        : vec4(0.55, 0.60, 0.70, 1.0);   // block instance outline
 }`;
 
 function compile(gl, type, src) {
@@ -266,7 +335,7 @@ function link(gl, vs, fs, uniforms) {
 
 const QUAD_U = ['u_cam', 'u_scale', 'u_res', 'u_minPx', 'u_palette',
                 'u_masters', 'u_rects', 'u_tiles', 'u_layerMask', 'u_colorMode',
-                'u_tileBase', 'u_rot'];
+                'u_tileBase', 'u_rot', 'u_layerAlpha', 'u_dens'];
 
 export class Renderer {
   constructor(gl, masters, caps) {
@@ -333,7 +402,18 @@ export class Renderer {
     this.instancesDropped = 0;
 
     this.scratch = new Int32Array(1 << 16);
+    // Layer visibility is a uniform and nothing else: toggling a layer changes
+    // one integer, never a buffer. Hidden layers collapse their vertices in the
+    // vertex shader rather than discarding fragments, so a hidden layer costs
+    // no rasterisation at all.
     this.layerMask = 0xffff;
+    // Per-layer alpha. All 1.0 is the opaque path, which is the fast one; any
+    // value below 1 switches drawing to ordered per-layer passes (see draw).
+    this.layerAlpha = new Float32Array(16).fill(1);
+    this.translucent = false;
+    this.densityRange = [0, 1];
+    this.blockSize = 0;
+    this.blockBounds = false;
     this.colorMode = 0;
     this.showTiles = false;
     this.minPx = 0;
@@ -412,6 +492,7 @@ export class Renderer {
     gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2, 1, gl.FLOAT, false, s, 16); gl.vertexAttribDivisor(2, 1);
     gl.enableVertexAttribArray(3); gl.vertexAttribIPointer(3, 1, gl.INT, s, 20); gl.vertexAttribDivisor(3, 1);
     gl.enableVertexAttribArray(4); gl.vertexAttribIPointer(4, 1, gl.INT, s, 28); gl.vertexAttribDivisor(4, 1);
+    gl.enableVertexAttribArray(5); gl.vertexAttribPointer(5, 1, gl.FLOAT, false, s, 24); gl.vertexAttribDivisor(5, 1);
     gl.bindVertexArray(null);
     return { vao, generation: pool.generation || 0 };
   }
@@ -600,6 +681,17 @@ export class Renderer {
   }
 
   // ------------------------------------------------------------ draw
+  //
+  // Two paths. Opaque is the default and the fast one: one pass, the depth test
+  // doing all the layer ordering, hidden layers collapsed in the vertex shader.
+  //
+  // Translucent is what per-layer alpha needs, and it needs the layers
+  // submitted bottom-up with depth writes off, because blending is
+  // order-dependent and the depth key cannot order what it is not writing. That
+  // is the constraint documented under "Rendering is opaque-only": the cost of
+  // lifting it is one pass per visible layer, so draw calls go from
+  // (buckets x instances) to (layers x buckets x instances). Worth paying only
+  // when someone has actually asked to see through the stack.
   draw(cam) {
     const gl = this.gl;
     gl.viewport(0, 0, cam.resW, cam.resH);
@@ -610,21 +702,55 @@ export class Renderer {
     gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, this.tileTex);
 
     const camX = cam.x - this.originX, camY = cam.y - this.originY;
-    const setup = p => {
+    const setup = (p, mask) => {
       gl.useProgram(p.prog);
       gl.uniform2f(p.U.u_cam, camX, camY);
       gl.uniform1f(p.U.u_scale, cam.scale);
       gl.uniform2f(p.U.u_res, cam.resW, cam.resH);
       gl.uniform1f(p.U.u_minPx, this.minPx);
-      gl.uniform1i(p.U.u_layerMask, this.layerMask);
+      gl.uniform1i(p.U.u_layerMask, mask);
       gl.uniform1i(p.U.u_colorMode, this.colorMode);
+      gl.uniform1fv(p.U.u_layerAlpha, this.layerAlpha);
+      gl.uniform2f(p.U.u_dens, this.densityRange[0], this.densityRange[1]);
     };
 
-    // The same slots, once per visible block instance. Nothing is re-uploaded
-    // between them: an instance is two uniforms, its window into the tile table
-    // and its orientation.
+    let calls = 0;
+    if (this.translucent) {
+      gl.depthMask(false);
+      gl.enable(gl.BLEND);
+      gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+      for (const layer of this.layerPasses()) calls += this._drawSet(setup, 1 << layer);
+      gl.depthMask(true);
+      gl.disable(gl.BLEND);
+    } else {
+      calls += this._drawSet(setup, this.layerMask);
+    }
+
+    if (this.blockBounds && this.instances.length > 1) calls += this._drawBlockBounds(cam, camX, camY);
+    if (this.showTiles) calls += this._drawTileBounds(cam, camX, camY);
+
+    gl.bindVertexArray(null);
+    this.drawCalls = calls;
+    return calls;
+  }
+
+  // Visible layers for the resident kind, bottom-up. Deep tiles carry real
+  // process layers; mid and far carry the three abstract ones.
+  layerPasses() {
+    const lo = this.kind === TILE_KIND.DEEP ? 0 : LAYER_CELLBOX;
+    const hi = this.kind === TILE_KIND.DEEP ? LAYER_CELLBOX - 1 : LAYER_POWERBOX;
+    const out = [];
+    for (let l = lo; l <= hi; l++) if ((this.layerMask >> l) & 1) out.push(l);
+    return out;
+  }
+
+  // One pass over everything resident, under one layer mask: the same slots,
+  // once per visible block instance.
+  _drawSet(setup, mask) {
+    const gl = this.gl;
+    let calls = 0;
     const perInstance = (p, body) => {
-      setup(p);
+      setup(p, mask);
       for (let i = 0; i < this.instances.length; i++) {
         const inst = this.instances[i];
         gl.uniform1i(p.U.u_tileBase, i * this.tileStride);
@@ -633,7 +759,6 @@ export class Renderer {
       }
     };
 
-    let calls = 0;
     if (this.kind === TILE_KIND.DEEP) {
       perInstance(this.deep, () => {
         for (let b = 0; b < this.deepPools.length; b++) {
@@ -662,12 +787,40 @@ export class Renderer {
         calls++;
       });
     }
-
-    if (this.showTiles) calls += this._drawTileBounds(cam, camX, camY);
-
-    gl.bindVertexArray(null);
-    this.drawCalls = calls;
     return calls;
+  }
+
+  // Block instance outlines. At chip zoom the blocks are the structure - where
+  // one ends and the next begins is the first thing to read off the view - and
+  // one line loop per instance is cheaper than any of the alternatives.
+  _drawBlockBounds(cam, camX, camY) {
+    const gl = this.gl;
+    const n = this.instances.length;
+    if (n === 0 || this.blockSize === 0) return 0;
+    const S = this.blockSize;
+    const data = new Float32Array(n * 5);
+    let w = 0;
+    for (const inst of this.instances) {
+      const m = inst.m;
+      const xs = [], ys = [];
+      for (const [x, y] of [[0, 0], [S, 0], [0, S], [S, S]]) {
+        xs.push(m[0] * x + m[2] * y + inst.tx - this.originX);
+        ys.push(m[1] * x + m[3] * y + inst.ty - this.originY);
+      }
+      data[w] = Math.min(...xs); data[w + 1] = Math.min(...ys);
+      data[w + 2] = Math.max(...xs) - Math.min(...xs);
+      data[w + 3] = Math.max(...ys) - Math.min(...ys);
+      data[w + 4] = 2; w += 5;
+    }
+    gl.bindVertexArray(this.lineVao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.lineBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, data, gl.DYNAMIC_DRAW);
+    gl.useProgram(this.lines.prog);
+    gl.uniform2f(this.lines.U.u_cam, camX, camY);
+    gl.uniform1f(this.lines.U.u_scale, cam.scale);
+    gl.uniform2f(this.lines.U.u_res, cam.resW, cam.resH);
+    gl.drawArraysInstanced(gl.LINE_LOOP, 0, 4, n);
+    return 1;
   }
 
   _drawTileBounds(cam, camX, camY) {

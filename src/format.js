@@ -4,7 +4,7 @@
 
 export const MAGIC_MASTERS = 0x4d4e544d;   // "MTNM"
 export const MAGIC_TILE    = 0x544e544d;   // "MTNT"
-export const VERSION       = 3;
+export const VERSION       = 4;
 
 export const RECT_TEX_WIDTH = 1024;
 
@@ -16,7 +16,7 @@ export const KIND_NAME = { 0: 'deep', 1: 'far', 2: 'mid' };
 export const M_STRIDE = 8;
 export const M_RECT_START = 0, M_RECT_COUNT = 1, M_W = 2, M_H = 3,
              M_KLASS = 4, M_ROW_H = 5;
-export const KLASS = { STD: 0, MACRO: 1, PWR: 2 };
+export const KLASS = { STD: 0, MACRO: 1, PWR: 2, FILL: 3 };
 
 // Bucket table record, in u32 units (deep tiles only).
 export const BK_STRIDE = 4;
@@ -26,13 +26,16 @@ export const BK_ID = 0, BK_START = 1, BK_COUNT = 2, BK_RECTS = 3;
 //   i32 x, i32 y, i32 packed(masterId | orient<<16 | flags<<24)
 export const I_STRIDE = 3;
 
-// Block record (far tiles): i32 x,y,w,h, f32 density, i32 layer, kind, -
+// Block record (far tiles): i32 x,y,w,h, f32 logic density, i32 layer,
+// f32 filler density, i32 spare (the tile slot, at runtime).
 export const B_STRIDE = 8;
-export const B_DENSITY = 4, B_LAYER = 5, B_KIND = 6, B_SPARE = 7;
+export const B_DENSITY = 4, B_LAYER = 5, B_FILL = 6, B_SPARE = 7;
 
 // Abstract layers used by mid and far tiles, and by class colouring.
 export const LAYER_CELLBOX = 12, LAYER_MACROBOX = 13, LAYER_POWERBOX = 14;
-export const CLASS_LAYER = [LAYER_CELLBOX, LAYER_MACROBOX, LAYER_POWERBOX];
+// Class -> abstract layer, for the depth key when colouring by class. Filler
+// shares the cell layer: it sits where cells sit, it is only coloured apart.
+export const CLASS_LAYER = [LAYER_CELLBOX, LAYER_MACROBOX, LAYER_POWERBOX, LAYER_CELLBOX];
 
 // Draws are grouped by rect-count bucket, so their number is a constant rather
 // than a function of library size. The caps are NOT a constant here: they are

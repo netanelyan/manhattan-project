@@ -1,5 +1,16 @@
 {
   "name": "manhattan",
   "private": true,
-  "type": "module"
+  "type": "module",
+  "scripts": {
+    "help": "node tools/dev.js help",
+    "dev": "node tools/dev.js dev",
+    "gen": "node tools/dev.js gen",
+    "big": "node tools/dev.js big",
+    "block": "node tools/dev.js block",
+    "verify": "node tools/dev.js verify",
+    "serve": "node tools/dev.js serve",
+    "bench": "node tools/dev.js bench",
+    "clean": "node tools/dev.js clean"
+  }
 }

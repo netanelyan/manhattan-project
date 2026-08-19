@@ -16,7 +16,7 @@
 
 import { viewMasters, KIND_NAME, key, overflowKey } from './format.js';
 import { Camera, attachControls } from './camera.js';
-import { Renderer, LAYER_NAMES, TOGGLE_LAYERS } from './renderer.js';
+import { Renderer, LAYER_NAMES, TOGGLE_LAYERS, CLASS_LAYER_NAMES } from './renderer.js';
 import { TileStore, PRIORITY } from './tiles.js';
 import { deriveLadder, LevelPicker, viewOf } from './lod.js';
 import { Chip, singleInstance, rectToBlock } from './chip.js';
@@ -261,6 +261,9 @@ async function boot() {
 
   const masters = viewMasters(await (await fetch(`${DATA}/masters.bin`)).arrayBuffer());
   renderer = new Renderer(gl, masters, manifest.bucketCaps);
+  renderer.densityRange = manifest.densityRange || [0, 1];
+  renderer.blockSize = manifest.world.size;
+  renderer.blockBounds = chip.count > 1;
 
   cam.fit(0, 0, chip.w, chip.h);
   // A partial pyramid (--one-tile) has no ladder to walk: only one level holds
@@ -279,6 +282,9 @@ async function boot() {
   if (params.has('mask')) renderer.layerMask = parseInt(params.get('mask'), 0);
   if (params.has('color')) renderer.colorMode = +params.get('color') ? 1 : 0;
   if (params.has('minpx')) renderer.minPx = +params.get('minpx');
+  if (params.has('alpha')) setTranslucent(renderer, +params.get('alpha') !== 0);
+  if (params.has('solo')) solo(renderer, +params.get('solo'));
+  if (params.has('blocks')) renderer.blockBounds = +params.get('blocks') !== 0;
 
   refresh();
   await store.settle();      // only so scripted runs are deterministic
@@ -461,12 +467,49 @@ function onCameraChange() {
 
 attachControls(canvas, cam, onCameraChange);
 window.addEventListener('resize', () => { resize(); onCameraChange(); });
+// Alpha for the translucent path. Everything a process engineer wants to see
+// through is routing: metal over via over metal. The lower layers stay nearly
+// opaque so the cell still reads as a cell.
+const ALPHA_PRESET = [1, 1, 0.85, 0.85, 0.8, 0.55, 0.6, 0.5, 0.45, 0.7, 0.9, 0.5, 1, 1, 1, 1];
+
+function setTranslucent(R, on) {
+  R.translucent = on;
+  for (let i = 0; i < 16; i++) R.layerAlpha[i] = on ? ALPHA_PRESET[i] : 1;
+}
+
+// Solo: show one layer, hide the rest. Toggling eight layers off to look at one
+// is the thing nobody does twice, so it is one keystroke - shift and the layer's
+// own number. Shift-clicking the soloed layer again restores what was visible
+// before it, not "everything": coming back to a working set matters.
+let soloLayer = -1, maskBeforeSolo = 0xffff;
+
+function solo(R, layer) {
+  if (soloLayer === layer) {
+    R.layerMask = maskBeforeSolo;
+    soloLayer = -1;
+    return;
+  }
+  if (soloLayer === -1) maskBeforeSolo = R.layerMask;
+  R.layerMask = 1 << layer;
+  soloLayer = layer;
+}
+
 window.addEventListener('keydown', e => {
   if (!renderer) return;
   const R = renderer;
-  if (e.key >= '1' && e.key <= '9') R.layerMask ^= 1 << TOGGLE_LAYERS[+e.key - 1];
+  // e.code, not e.key: shift turns '1' into '!' and the layer keys have to keep
+  // working with it held.
+  const digit = /^Digit([1-9])$/.exec(e.code);
+  if (digit) {
+    const layer = TOGGLE_LAYERS[+digit[1] - 1];
+    if (e.shiftKey) solo(R, layer);
+    else { R.layerMask ^= 1 << layer; soloLayer = -1; }
+    return;
+  }
   switch (e.key) {
-    case 'a': R.layerMask = R.layerMask === 0xffff ? 0 : 0xffff; break;
+    case 'a': R.layerMask = R.layerMask === 0xffff ? 0 : 0xffff; soloLayer = -1; break;
+    case 'v': setTranslucent(R, !R.translucent); break;
+    case 'b': R.blockBounds = !R.blockBounds; break;
     case 'c': R.colorMode ^= 1; break;
     case 't': R.showTiles = !R.showTiles; break;
     case 'p': R.minPx = R.minPx > 0 ? 0 : 1; break;
@@ -512,8 +555,11 @@ function ladderLine() {
 }
 
 function layerLine(R) {
-  return TOGGLE_LAYERS.map((l, i) =>
-    `${(R.layerMask >> l) & 1 ? '+' : '-'}${i + 1}:${LAYER_NAMES[l]}`).join(' ');
+  return TOGGLE_LAYERS.map((l, i) => {
+    const on = (R.layerMask >> l) & 1;
+    const a = R.translucent && R.layerAlpha[l] < 1 ? `(${R.layerAlpha[l].toFixed(2)})` : '';
+    return `${on ? '+' : '-'}${i + 1}:${LAYER_NAMES[l]}${a}`;
+  }).join(' ');
 }
 
 function drawHud(dt) {
@@ -540,9 +586,9 @@ update     last ${R.updateMs.toFixed(2)} ms (+${R.lastAdded}/-${R.lastRemoved} t
 frame      ${dt.toFixed(2)} ms  (submit ${submitMs.toFixed(2)} ms)   fps(60) ${(1000 / avg).toFixed(1)}
 memory     masters ${mb(R.masters.bytes)} MB   gpu slots ${mb(R.poolBytes)} MB
 zoom       ${cam.scale.toExponential(2)} px/nm   ${nmPerPx < 1 ? (nmPerPx * 1000).toFixed(1) + ' pm/px' : nmPerPx.toFixed(1) + ' nm/px'}   origin ${R.originX.toFixed(0)},${R.originY.toFixed(0)}
-layers     ${layerLine(R)}   (+ visible, - hidden)
-color      ${R.colorMode ? 'by class' : 'by layer'}   tiles ${R.showTiles ? 'on' : 'off'}   minPx ${R.minPx.toFixed(1)}   ring ${PREFETCH_RING}   multi_draw ${R.multiDraw ? 'available (unused)' : 'unavailable'}
-keys       drag pan, wheel zoom, l auto/manual level, [ ] level by hand, f fit, 1-9 layer, a all, c colour, t tiles, p subpixel, r reset, -/= cache
+layers     ${layerLine(R)}   ${soloLayer >= 0 ? `SOLO ${LAYER_NAMES[soloLayer]}` : '(+ visible, - hidden)'}
+color      ${R.colorMode ? `by class: ${CLASS_LAYER_NAMES.join(' / ')}` : 'by layer'}   ${R.translucent ? 'translucent (layer passes)' : 'opaque'}   density ${(100 * R.densityRange[0]).toFixed(0)}-${(100 * R.densityRange[1]).toFixed(0)}%   tiles ${R.showTiles ? 'on' : 'off'}   blocks ${R.blockBounds ? 'on' : 'off'}   minPx ${R.minPx.toFixed(1)}   ring ${PREFETCH_RING}
+keys       drag pan, wheel zoom, l auto/manual level, [ ] level by hand, f fit, 1-9 layer, shift+1-9 solo, a all, c colour, v translucent, b blocks, t tiles, p subpixel, r reset, -/= cache
 ${status}`;
 }
 

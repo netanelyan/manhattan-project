@@ -6,7 +6,7 @@
 // "MTNM" and "MTNT" in file byte order, read back as little-endian uint32.
 const MAGIC_MASTERS = 0x4d4e544d;
 const MAGIC_TILE    = 0x544e544d;
-const VERSION       = 3;
+const VERSION       = 4;
 
 // masters.bin
 const M_HEADER_BYTES = 32;
@@ -116,8 +116,11 @@ function bucketOf(rectCount, caps) {
 // (layer id) paints cells, then macros, then the power grid.
 const ABSTRACT_LAYER = { CELLBOX: 12, MACROBOX: 13, POWERBOX: 14 };
 
-// Block sub-kinds inside a far tile.
-const BLOCK_KIND = { DENSITY: 0, MACRO: 1, POWER: 2 };
+// A far tile's block record carries two density channels: how much of the block
+// is logic, and how much of it is filler. Occupied and useful are different
+// questions, and a full-die view that cannot tell them apart calls a dead
+// region dense. The second channel replaces what was a redundant sub-kind word
+// - the abstract layer already says whether a block is cells, a macro or power.
 
 // --- Overflow.
 //
@@ -162,7 +165,7 @@ module.exports = {
   T_HEADER_BYTES, BUCKET_BYTES, INSTANCE_BYTES, BLOCK_BYTES,
   TILE_KIND, KIND_NAME, RECORD_BYTES, RECT_TEX_WIDTH,
   BUCKET_CAPS_FALLBACK, DEFAULT_BUCKETS, deriveCaps, capCost, bucketOf,
-  ABSTRACT_LAYER, BLOCK_KIND,
+  ABSTRACT_LAYER,
   OVERSIZE_FRAC, OVERFLOW_XY,
   RECT_BUDGET, VIS_TILES, TILE_PX, MIN_CELL_PX, MAX_DEEP, BLOCK_GRID,
   REF_VIEW, MAX_VIS_TILES, LOD_HYSTERESIS,

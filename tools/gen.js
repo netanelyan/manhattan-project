@@ -9,6 +9,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { spawnSync } = require('child_process');
 const layout = require('./layout.js');
 const P = require('./pyramid.js');
 const C = require('./chip.js');
@@ -20,7 +21,7 @@ function parseArgs(argv) {
     count: 1000000, out: 'data', seed: 42, perTile: 4096,
     densityLo: 0.40, densityHi: 0.95, oneTile: false,
     buckets: F.DEFAULT_BUCKETS, strapAlign: false,
-    blocks: 70, blockOrient: 'rows', blockGap: 0.01,
+    blocks: 70, blockOrient: 'rows', blockGap: 0.01, verify: true,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -41,6 +42,7 @@ function parseArgs(argv) {
       case '--block-orient': o.blockOrient = next(); break;
       case '--block-gap': o.blockGap = +next(); break;
       case '--one-tile':  o.oneTile = true; break;
+      case '--no-verify': o.verify = false; break;
       case '-h': case '--help': usage(); process.exit(0);
       default: console.error(`unknown flag ${a}`); usage(); process.exit(1);
     }
@@ -80,7 +82,8 @@ function usage() {
   --blocks N      block instances in the synthetic chip                [70]
   --block-orient  none | rows (mirror alternate rows) | all            [rows]
   --block-gap F   routing channel between blocks, as a fraction        [0.01]
-  --one-tile      emit only the busiest deepest-level tile`);
+  --one-tile      emit only the busiest deepest-level tile
+  --no-verify     skip the verify pass that normally follows generation`);
 }
 
 const fmt = n => n.toLocaleString('en-US');
@@ -145,7 +148,8 @@ async function main() {
   const n = gen.instances.n;
   console.log(`${gen.genMs}ms`);
   console.log(`  die         ${um(gen.dieW)} x ${um(gen.dieH)}  (${gen.numRows} rows)`);
-  console.log(`  instances   ${fmt(n)} = ${fmt(gen.stdCount)} cells + ${fmt(gen.pwrCount)} power + ${gen.macroCount} macros` +
+  console.log(`  instances   ${fmt(n)} = ${fmt(gen.stdCount - gen.fillCount)} logic + ${fmt(gen.fillCount)} filler + ` +
+              `${fmt(gen.pwrCount)} power + ${gen.macroCount} macros` +
               `  (straps ${gen.strapAligned ? 'tile-aligned' : 'unaligned'}, ${um(gen.strapSeg)} segments)`);
   console.log(`  masters     ${fmt(gen.masters.length)}, ${fmt(gen.rects.length / 8)} rects, ` +
               `${gen.meanRects.toFixed(1)} rects/placement avg, max ${gen.masters.reduce((a, m) => Math.max(a, m.rectCount), 0)} per master`);
@@ -182,14 +186,16 @@ async function main() {
   // --- far levels need a density mip chain plus the structures worth keeping
   // sharp. Both are built once and shared across every far level.
   const farLevels = levels.filter(L => L.kind === F.TILE_KIND.FAR);
-  let mips = null, structures = null;
+  let mips = null, structures = null, densityLoHi = [0, 1];
   if (farLevels.length) {
     const tf = Date.now();
     const zFarMax = Math.max(...farLevels.map(L => L.z));
     mips = P.buildDensityMips(gen, worldSize, zFarMax);
+    densityLoHi = P.densityRange(mips, zFarMax);
     structures = P.collectStructures(gen);
     console.log(`  density     ${F.BLOCK_GRID << zFarMax}^2 raster, ${structures.macros.length} macros, ` +
-                `${structures.straps.length} merged straps, ${Date.now() - tf}ms`);
+                `${structures.straps.length} merged straps, logic density p5..p95 ` +
+                `${(100 * densityLoHi[0]).toFixed(0)}..${(100 * densityLoHi[1]).toFixed(0)}%, ${Date.now() - tf}ms`);
   }
 
   // --- scratch sized for the largest tile that gathers instances
@@ -400,6 +406,7 @@ async function main() {
     rectTexWidth: F.RECT_TEX_WIDTH,
     meanRectsPerInstance: +gen.meanRects.toFixed(2),
     blockGrid: F.BLOCK_GRID,
+    densityRange: densityLoHi,
     rectBudget: F.RECT_BUDGET,
     bucketCaps: caps,
     meanCellWidth,
@@ -440,6 +447,24 @@ async function main() {
   console.log(`              ${fmt(opts.blocks * n)} placements at chip level, in ${mb(totalBytes)} of tiles ` +
               `(flattened it would be ~${mb(flatBytes)})`);
   console.log(`  -> ${outDir}`);
+
+  // --- the gate.
+  //
+  // Generating and verifying used to be two things a person remembered to do in
+  // order, which is exactly how a writer and a checker drift apart without
+  // anyone noticing: the far tile record grew a filler-density channel where a
+  // block-kind enum used to be, and the tiles were correct and the checker was
+  // stale for as long as nobody ran both. Now one cannot happen without the
+  // other.
+  if (opts.verify) {
+    console.log('');
+    const r = spawnSync(process.execPath, [path.join(__dirname, 'verify.js'), outDir],
+                        { stdio: 'inherit' });
+    if (r.status !== 0) {
+      console.error('generation produced data that does not verify - see above');
+      process.exit(r.status || 1);
+    }
+  }
 }
 
 main().catch(e => { console.error(e); process.exit(1); });

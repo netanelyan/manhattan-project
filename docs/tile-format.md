@@ -349,10 +349,10 @@ Merged aggregate geometry, `count` records of 32 bytes. No bucket table.
 | 4 | i32 | `y` | |
 | 8 | i32 | `w` | |
 | 12 | i32 | `h` | |
-| 16 | f32 | `density` | in `(0, 1]`, fraction of the block covered by cells |
+| 16 | f32 | `density` | logic area as a fraction of the block, in `[0, 1]` |
 | 20 | i32 | `layer` | 12 cellbox, 13 macrobox, 14 powerbox |
-| 24 | i32 | `kind` | 0 = density, 1 = macro, 2 = power |
-| 28 | i32 | — | reserved |
+| 24 | f32 | `fill` | filler and decap area, same units |
+| 28 | i32 | — | reserved (the viewer writes the tile slot here) |
 
 A far tile holds three things:
 
@@ -361,14 +361,49 @@ A far tile holds three things:
 - **macro blocks**, one per macro overlapping the tile;
 - **power blocks**, strap segments coalesced into long runs.
 
-Density comes from a mip chain: the finest far level bins every standard cell's
-area into a `BLOCK_GRID · 2^zFarMax` raster, and coarser levels are 2×2 averages
-of it. The viewer renders `palette[layer] · (0.22 + 0.78·density)`.
+Density comes from a mip chain: the finest far level bins cell area into a
+`BLOCK_GRID · 2^zFarMax` raster, and coarser levels are 2×2 averages of it.
+
+**Two channels, because occupied and useful are different questions.** Logic
+area and filler area are binned separately. A region packed with decaps is full
+and doing nothing, and a single "how full is this" number calls it busy — which
+is one of the ways a full-die view turns into a wash. The second channel costs
+nothing: the record had a spare word, and the sub-kind word it replaced was
+redundant with `layer`.
 
 Keeping macros and the power grid as sharp objects rather than averaging them
-into the field is the point. Averaging everything is precisely the uniform grey
-the spike found at fit-to-die zoom; a density gradient with macro blocks and a
-visible power grid is a readable map.
+into the field is the rest of it. Averaging everything is precisely the uniform
+grey the spike found at fit-to-die zoom; a density gradient with macro blocks
+and a visible power grid is a readable map.
+
+#### What the viewer does with it
+
+A single hue scaled by density is the mud again: a design running 28–56% logic
+density spends its whole range in one part of one ramp, and every region comes
+out the same colour. So:
+
+- the ramp walks **hue as well as lightness** — deep blue, teal, green, yellow,
+  orange — so neighbouring densities are distinguishable rather than merely
+  ordered;
+- it is stretched across `manifest.densityRange`, the design's own p5..p95 logic
+  density, instead of `[0, 1]`, which is where the contrast comes from;
+- **dead area leaves the ramp**: as filler comes to dominate a block's occupied
+  area, its colour is mixed toward a flat grey, so "full of decap" cannot be
+  mistaken for "full of logic".
+
+The colour is independent of the depth key, so colouring by cell class does not
+disturb painting order.
+
+**On the synthetic data the filler channel is nearly flat, and that is a
+property of the generator, not of the format.** Filler here is drawn from the
+same global usage distribution as logic, so it is spread evenly at ~30% of
+placements; a real design fills whatever the placer left, so filler concentrates
+exactly where utilisation is low. On this data the *logic* channel carries the
+regional signal and sparse regions read blue. Making the generator fill leftover
+row space was tried and reverted: it is the faithful model, but it resizes the
+die (occupancy stops being the density mean), moves every switch point, and
+changes which levels are worth writing — a placement-model decision worth taking
+deliberately rather than as a side effect of a rendering change.
 
 **Unlike placements, block geometry is clipped to tile bounds.** Aggregates may
 be split across tiles because they carry no identity — a macro appearing as four
@@ -451,6 +486,10 @@ Bootstrap metadata. The only file parsed as text, fetched once.
   `rectP95PerTile` is the same percentile of what a tile actually costs to
   draw, taken over the tiles as written, and it is what the runtime level
   choice budgets against.
+- `densityRange` is the p5 and p95 of logic density over the finest far level's
+  non-empty blocks. It is the interval the viewer stretches its density ramp
+  across; a ramp over `[0, 1]` on a design that occupies a fifth of that range
+  is a flat wash.
 - `lod.solvedFor` is the block instance geometry the shipped ladder was solved
   for: instance count, distinct positions per axis, pitch, block size. A viewer
   with a different `chip.json` re-solves; this is what makes the shipped numbers
@@ -606,15 +645,27 @@ of `S`:
 | FE | y | x | `0,1,1,0` | `0,0` |
 
 The offset is what puts the block's own box back at the origin after a flip, so
-a placed instance covers `[x, x+S] × [y, y+S]` whatever its orientation. Two
-consequences the rest of the design leans on:
+a placed instance covers `[x, x+S] × [y, y+S]` whatever its orientation.
 
-- **A rect stays a rect.** All eight maps are axis-preserving, so the viewport
-  transformed into an instance's block space is still an axis-aligned
-  rectangle, and tile culling runs unchanged inside the block.
-- **The inverse is exact.** Every entry is 0, ±1 and every offset is a whole
-  nanometre, so `toBlock(toChip(p)) == p` bit-for-bit. `tools/verify.js` checks
-  it on every instance, at the block corners and at an arbitrary interior point.
+**Being restricted to these eight is the reason block instancing cost almost
+nothing to add.** It is not a property the design happens to have; it is the
+property the design is built on, and it is worth being explicit about what it
+buys, because anyone extending this to arbitrary transforms is giving all of it
+up at once:
+
+| because every matrix entry is 0 or ±1 with whole-nanometre offsets | which means |
+|---|---|
+| a rect maps to a rect | the viewport transformed into an instance's block space is still an axis-aligned rectangle, so tile culling runs **unchanged** inside the block — no clipping against rotated bounds, no conservative over-fetch |
+| the inverse is exact | `toBlock(toChip(p)) == p` bit-for-bit, so the viewer can invert per frame with no epsilon and no drift. `tools/verify.js` checks it on every instance, at the block corners and at an interior point |
+| geometry stays Manhattan | the whole renderer's one invariant survives the transform: everything on screen is still an axis-aligned rectangle, so the quad path, the subpixel test and the depth key all work untouched |
+| the transform is exact in integers | tile origins stay whole nanometres, so the f64-on-the-CPU / f32-in-the-shader split that keeps precision at chip scale is unaffected |
+
+A general affine placement — arbitrary rotation, or scaling — breaks every row
+of that table at once: culling would need rotated bounds and would over-fetch,
+the inverse would carry rounding, rectangles would arrive at the rasteriser as
+rotated quads, and a scaled instance would want a different LOD level from its
+neighbours. Chip assembly does not need any of it — LEF/DEF orientations are
+exactly these eight — which is why the format does not offer it.
 
 ### Fetched once, drawn N times
 
@@ -754,6 +805,41 @@ empty another window, so the pass iterates to a fixpoint. The pyramid it leaves
 has gaps: `z` is not a dense range, and the viewer steps between the levels that
 exist.
 
+#### The tile set is not a pure function of the block
+
+This is the part to write down. Which levels get written depends on **the chip
+the block is instanced into**, because a level's cost on screen is summed over
+the instances the viewport touches. A block's coarse far levels exist to serve
+the chip view, where dozens of blocks are on screen at once; seen alone, a block
+never needs a far mip below its own finest, and the ladder says so:
+
+| generated with | levels written |
+|---|---|
+| `--blocks 70` | z0 z1 z2 z3 z4 z6 |
+| `--blocks 1` | z3 z4 z6 — z0, z1 and z2 have empty windows |
+
+Identical block data, different pyramid. `manifest.lod.solvedFor` records the
+instance geometry the ladder was solved for, so what a set of tiles assumes is
+at least legible after the fact.
+
+The consequence is operational, not theoretical: **changing the chip assembly
+can force a retile even though no block data changed.** Placing the block 70
+times instead of once, or spacing the instances differently, moves the switch
+points and can make a skipped level necessary again. At a block of tens of
+gigabytes that is hours of work triggered by an edit to a manifest, so it is
+worth deciding deliberately rather than discovering.
+
+Two ways out, neither taken here because both cost something real:
+
+- **Write every planned level regardless.** The pyramid is then a pure function
+  of the block, at the price of the disk this section exists to save — 33% on
+  the 5M design.
+- **Solve the ladder for the widest chip the block might land in** (say, 4096
+  instances) and write for that. Levels stop depending on the assembly, and the
+  cost is a few coarse levels that a small chip will never select — cheap, since
+  coarse levels are the small ones. This is the better trade if retiling is
+  expensive, and it is a one-line change to what `viewOf` is handed.
+
 One consequence worth knowing: a shadowed level is also the natural *parent* for
 parent-while-loading (see Known constraints). Dropping z5 means the parent of
 the deepest level is the mid level, which is a coarser fallback but a legitimate
@@ -837,6 +923,47 @@ Two things the sweep shows that the ladder alone does not:
 
 ---
 
+## Layers
+
+A layout is a stack, and drawn flat and opaque the upper layers hide what is
+underneath. Almost every question worth asking is layer-scoped — is metal3
+congested here, does poly cross diffusion at this point — so the layer controls
+are not decoration, they are how the view gets asked a question.
+
+All of it is uniforms. Nothing below rebuilds a buffer, re-uploads a slot or
+re-fetches a tile; the geometry on the GPU is the same geometry whatever is
+being shown.
+
+| control | key | mechanism |
+|---|---|---|
+| visibility | `1`-`9` | `u_layerMask`, one bit per layer id. A hidden layer's vertices collapse to a degenerate position in the vertex shader, so it costs no rasterisation |
+| solo | `shift`+`1`-`9` | the mask, set to one bit. Repeating it restores the mask that was in force before, not "everything" |
+| all on / off | `a` | the mask, set to `0xffff` or `0` |
+| per-layer alpha | `v` | `u_layerAlpha[16]`, and the ordered per-layer pass described under "Rendering is opaque-only" |
+| colour by layer / class | `c` | `u_colorMode`; the palette index is a varying, separate from the depth key |
+
+Hiding a layer in the vertex shader rather than discarding fragments is
+deliberate: a discarded fragment has already cost a rasterised pixel, while a
+collapsed vertex costs nothing downstream at all. The visible result is the
+same.
+
+### Colour by class
+
+The classes are the ones the format carries in `masters.bin`: **standard cell**,
+**macro**, **power**, and **filler/decap**. Filler is a class rather than a flag
+because it is the difference between area that is occupied and area that is
+doing something, which is the same distinction the far levels' second density
+channel exists for.
+
+Combinational versus sequential is **not** in the data model. It is the split an
+engineer would want next — where the flops are — and it does not fit for a
+concrete reason worth recording: colouring by class indexes a palette that also
+serves the 16 layer ids, and the depth key is `1 - layer/16`, so the layer id
+space is full at 16. Adding a class costs a palette slot, which exists, but
+adding a *layer* would cost a re-cut of the depth key.
+
+---
+
 ## Streaming and eviction
 
 The viewer never blocks a frame on the network. `refresh()` tells the store
@@ -874,18 +1001,27 @@ results: whichever fragment lands first wins the depth test and later fragments
 behind it are discarded rather than blended, so the composite depends on
 submission order.
 
-Supporting translucency would require depth writes off and explicit
-back-to-front ordering per layer — that is, drawing layer by layer, which
-conflicts with grouping draws by rect-count bucket, because a bucket contains
-masters whose rects span every layer. The likely resolution is a per-layer pass
-over the bucket buffers (layers × buckets draw calls, so ~15 × 4 = 60 - still
-tractable), with the layer mask narrowed to one layer per pass. Neither is
-implemented. **The current renderer is opaque-only and the format does not carry
-per-layer alpha.**
+Supporting translucency needs depth writes off and explicit back-to-front
+ordering per layer — that is, drawing layer by layer, which conflicts with
+grouping draws by rect-count bucket, because a bucket contains masters whose
+rects span every layer.
 
-Layer *visibility* is implemented and is a different thing: `u_layerMask` is a
-16-bit uniform and hidden layers collapse their vertices, which needs no
-ordering guarantees.
+**That pass is now implemented**, and it is what per-layer alpha uses:
+`layers × buckets × instances` draw calls with the layer mask narrowed to one
+layer per pass, depth writes off, blending on. Inside one block that is 12 × 8 =
+96 calls, measured. It is off by default because the opaque path is one pass and
+correct, and it is on the moment any layer's alpha drops below 1.
+
+Two things it does not fix. Overlapping geometry *within* one layer blends with
+itself rather than being resolved by depth — in this data cells do not overlap
+their own layers, so it does not arise, but it is not a guarantee the renderer
+makes. And the cost scales with visible layers, so it is a deep-zoom tool: at
+chip zoom the same switch would multiply 70 instance draws by every abstract
+layer.
+
+Layer *visibility* is cheaper and unconditional: `u_layerMask` is a 16-bit
+uniform, hidden layers collapse their vertices in the vertex shader, and nothing
+is rasterised for them. **Hiding a layer never touches a buffer** — see Layers.
 
 ### Draw calls are bounded by bucket count, not library size
 
@@ -1037,7 +1173,11 @@ per-level quantum in the contract, so it is not done.
 | levels no zoom can select | done — solved before writing, skipped, listed in `lod.shadowed` |
 | block instances, chip level | done — `chip.json`, fetched once and drawn N times |
 | several distinct blocks in one chip | in the format, not in the viewer |
-| chip-level merged representation | next — coarser than one tile per block |
+| density representation, logic and filler channels | done |
+| layer visibility, solo, per-layer alpha | done — alpha via ordered per-layer passes |
+| colour by cell class | done — cell / macro / power / filler |
+| combinational vs sequential class | not in the data model, see Layers |
+| chip-level merged representation | not needed yet — the block's coarsest level serves the chip view; below one tile per block would need it |
 | cross-fade between levels | not implemented — two opaque passes composited, see Known constraints |
 | translucent layers | not planned, see Known constraints |
 

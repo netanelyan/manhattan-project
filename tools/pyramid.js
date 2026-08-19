@@ -290,37 +290,62 @@ function buildOverflowTile(gen, idx, z, kind, worldSize, scratch, caps) {
 // is exactly the mud the spike found; keeping the structure that carries
 // meaning - macro blocks, the power grid, the density gradient between regions
 // - is what makes a full-die view readable.
+// Two channels, not one: logic area and filler area. A region packed with
+// decaps is occupied but dead, and a single "how full is this" number calls it
+// busy - which is exactly the grey mud the spike ran into. Keeping them apart
+// costs one word in a record that had a spare.
 function buildDensityMips(gen, worldSize, zFarMax) {
   const { x, y, m, n } = gen.instances;
   const masters = gen.masters;
   const R = F.BLOCK_GRID << zFarMax;
-  const base = new Float64Array(R * R);
+  const logic = new Float64Array(R * R);
+  const fill = new Float64Array(R * R);
   const cell = worldSize / R;
 
   for (let i = 0; i < n; i++) {
     const ms = masters[m[i]];
-    if (ms.klass !== K.STD) continue;
+    if (ms.klass !== K.STD && ms.klass !== K.FILL) continue;
     let gi = ((x[i] + ms.w * 0.5) / cell) | 0;
     let gj = ((y[i] + ms.h * 0.5) / cell) | 0;
     if (gi < 0) gi = 0; else if (gi >= R) gi = R - 1;
     if (gj < 0) gj = 0; else if (gj >= R) gj = R - 1;
-    base[gj * R + gi] += ms.w * ms.h;
+    (ms.klass === K.FILL ? fill : logic)[gj * R + gi] += ms.w * ms.h;
   }
   const cellArea = cell * cell;
-  for (let i = 0; i < base.length; i++) base[i] = Math.min(1, base[i] / cellArea);
+  for (let i = 0; i < logic.length; i++) {
+    logic[i] = Math.min(1, logic[i] / cellArea);
+    fill[i] = Math.min(1, fill[i] / cellArea);
+  }
 
   const mips = [];
-  mips[zFarMax] = base;
+  mips[zFarMax] = { logic, fill };
   for (let z = zFarMax - 1; z >= 0; z--) {
     const sHi = F.BLOCK_GRID << (z + 1), sLo = F.BLOCK_GRID << z;
-    const hi = mips[z + 1], lo = new Float64Array(sLo * sLo);
-    for (let j = 0; j < sLo; j++)
-      for (let i = 0; i < sLo; i++)
-        lo[j * sLo + i] = 0.25 * (hi[(2 * j) * sHi + 2 * i] + hi[(2 * j) * sHi + 2 * i + 1] +
-                                  hi[(2 * j + 1) * sHi + 2 * i] + hi[(2 * j + 1) * sHi + 2 * i + 1]);
-    mips[z] = lo;
+    const hi = mips[z + 1];
+    const out = { logic: new Float64Array(sLo * sLo), fill: new Float64Array(sLo * sLo) };
+    for (const ch of ['logic', 'fill']) {
+      const h = hi[ch], l = out[ch];
+      for (let j = 0; j < sLo; j++)
+        for (let i = 0; i < sLo; i++)
+          l[j * sLo + i] = 0.25 * (h[(2 * j) * sHi + 2 * i] + h[(2 * j) * sHi + 2 * i + 1] +
+                                   h[(2 * j + 1) * sHi + 2 * i] + h[(2 * j + 1) * sHi + 2 * i + 1]);
+    }
+    mips[z] = out;
   }
   return mips;
+}
+
+// The 5th and 95th percentiles of logic density over the finest far level's
+// non-empty blocks. The viewer stretches its colour ramp across this, because a
+// ramp over [0, 1] on a design that runs 40-95% full spends most of its range
+// on values that do not occur - which is the difference between a readable map
+// and a flat wash.
+function densityRange(mips, zFarMax) {
+  const v = Array.from(mips[zFarMax].logic).filter(d => d > 0.004).sort((a, b) => a - b);
+  if (!v.length) return [0, 1];
+  const at = q => v[Math.min(v.length - 1, Math.floor(v.length * q))];
+  const lo = at(0.05), hi = at(0.95);
+  return [+lo.toFixed(4), +(hi > lo ? hi : lo + 0.01).toFixed(4)];
 }
 
 function collectStructures(gen) {
@@ -377,22 +402,22 @@ function farTileBlocks(mips, structures, z, tx, ty, tileSize, worldSize) {
     const gj = ty * grid + bj;
     for (let bi = 0; bi < grid; bi++) {
       const gi = tx * grid + bi;
-      const d = mip[gj * side + gi];
-      if (d < 0.004) continue;
+      const d = mip.logic[gj * side + gi], f = mip.fill[gj * side + gi];
+      if (d + f < 0.004) continue;              // genuinely empty, not merely dead
       const x0 = edge(gi), x1 = edge(gi + 1), y0 = edge(gj), y1 = edge(gj + 1);
       blocks.push([x0 - originX, y0 - originY, x1 - x0, y1 - y0, d,
-                   F.ABSTRACT_LAYER.CELLBOX, F.BLOCK_KIND.DENSITY]);
+                   F.ABSTRACT_LAYER.CELLBOX, f]);
     }
   }
 
-  const clip = (r, layer, kind) => {
+  const clip = (r, layer) => {
     const x0 = Math.max(r.x, originX), y0 = Math.max(r.y, originY);
     const x1 = Math.min(r.x + r.w, originX + tileSize), y1 = Math.min(r.y + r.h, originY + tileSize);
     if (x1 <= x0 || y1 <= y0) return;
-    blocks.push([x0 - originX, y0 - originY, x1 - x0, y1 - y0, 1, layer, kind]);
+    blocks.push([x0 - originX, y0 - originY, x1 - x0, y1 - y0, 1, layer, 0]);
   };
-  for (const r of structures.macros) clip(r, F.ABSTRACT_LAYER.MACROBOX, F.BLOCK_KIND.MACRO);
-  for (const r of structures.straps) clip(r, F.ABSTRACT_LAYER.POWERBOX, F.BLOCK_KIND.POWER);
+  for (const r of structures.macros) clip(r, F.ABSTRACT_LAYER.MACROBOX);
+  for (const r of structures.straps) clip(r, F.ABSTRACT_LAYER.POWERBOX);
   return blocks;
 }
 
@@ -415,7 +440,7 @@ function buildFarTile(mips, structures, z, tx, ty, tileSize, worldSize) {
     if (b[1] + b[3] > maxY) maxY = b[1] + b[3];
     i32[p] = b[0]; i32[p + 1] = b[1]; i32[p + 2] = b[2]; i32[p + 3] = b[3];
     f32[p + 4] = b[4];
-    i32[p + 5] = b[5]; i32[p + 6] = b[6]; i32[p + 7] = 0;
+    i32[p + 5] = b[5]; f32[p + 6] = b[6]; i32[p + 7] = 0;
     p += 8;
   }
   if (n === 0) { minX = minY = maxX = maxY = 0; }
@@ -501,5 +526,5 @@ module.exports = {
   oversizeMask, collectOverflow,
   buildDeepTile, buildMidTile, buildFarTile, farTileBlocks, buildOverflowTile,
   levelRectCounts, overflowCost, p95NonEmpty,
-  buildDensityMips, collectStructures, coverageBitmap, orientedBox,
+  buildDensityMips, densityRange, collectStructures, coverageBitmap, orientedBox,
 };

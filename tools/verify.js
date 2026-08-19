@@ -45,12 +45,14 @@ check(rectsOff + rectCount * F.RECT_BYTES === mbuf.byteLength, 'masters.bin size
 const md = new Int32Array(mbuf, mastersOff, masterCount * 8);
 const rd = new Int32Array(mbuf, rectsOff, rectCount * 8);
 let minR = 1e9, maxR = 0, sumR = 0;
-const klass = [0, 0, 0];
+const klass = [0, 0, 0, 0];
 for (let m = 0; m < masterCount; m++) {
   const s = md[m * 8], c = md[m * 8 + 1], w = md[m * 8 + 2], h = md[m * 8 + 3];
   check(s >= 0 && s + c <= rectCount, `master ${m} rect range`);
   check(w > 0 && h > 0, `master ${m} bbox`);
-  klass[md[m * 8 + 4]]++;
+  const k = md[m * 8 + 4];
+  check(k >= 0 && k < klass.length, `master ${m} class ${k}`);
+  klass[k]++;
   minR = Math.min(minR, c); maxR = Math.max(maxR, c); sumR += c;
   for (let r = s; r < s + c; r++) {
     const x = rd[r * 8], y = rd[r * 8 + 1], rw = rd[r * 8 + 2], rh = rd[r * 8 + 3];
@@ -63,7 +65,7 @@ check(maxR === manifest.maxRectsPerMaster, 'manifest maxRectsPerMaster');
 check(masterCount * 2 <= F.RECT_TEX_WIDTH * 2048, 'master table fits its texture');
 check(rectCount * 2 <= F.RECT_TEX_WIDTH * 2048, 'rect table fits its texture');
 console.log(`masters.bin ${masterCount.toLocaleString()} masters ` +
-            `(${klass[0]} std / ${klass[1]} macro / ${klass[2]} power), ` +
+            `(${klass[0]} std / ${klass[1]} macro / ${klass[2]} power / ${klass[3]} filler), ` +
             `${rectCount.toLocaleString()} rects, ${minR}..${maxR} per master, ` +
             `${Math.ceil(rectCount * 2 / F.RECT_TEX_WIDTH)} texture rows`);
 
@@ -119,11 +121,16 @@ function checkTile(buf, lvl, kindId, tag, tx, ty, isOverflow) {
     const bf = new Float32Array(buf, dataOff, count * 8);
     for (let k = 0; k < count; k++) {
       const x = bi[k * 8], y = bi[k * 8 + 1], w = bi[k * 8 + 2], h = bi[k * 8 + 3];
-      const d = bf[k * 8 + 4], layer = bi[k * 8 + 5], bk = bi[k * 8 + 6];
+      const d = bf[k * 8 + 4], layer = bi[k * 8 + 5], fill = bf[k * 8 + 6];
       check(x >= 0 && y >= 0 && w > 0 && h > 0 && x + w <= S && y + h <= S, tag + ' block not clipped');
-      check(d > 0 && d <= 1.0001, tag + ' block density');
+      check(d >= 0 && d <= 1.0001, tag + ' block logic density');
+      check(fill >= 0 && fill <= 1.0001, tag + ' block filler density');
+      // A block exists because something is there. All-filler is a legitimate
+      // block - that is the dead area the far view is meant to show - but a
+      // block with neither logic nor filler is one that should not have been
+      // written at all.
+      check(d + fill > 0.003 || layer !== 12, tag + ' empty density block written');
       check(layer >= 12 && layer <= 14, tag + ' block layer');
-      check(bk >= 0 && bk <= 2, tag + ' block kind');
       cMinX = Math.min(cMinX, x); cMinY = Math.min(cMinY, y);
       cMaxX = Math.max(cMaxX, x + w); cMaxY = Math.max(cMaxY, y + h);
     }
@@ -280,6 +287,9 @@ Promise.all([import('../src/lod.js'), import('../src/chip.js')]).then(([LOD, CHI
     }
     check(L.tileCount === 0 || L.rectP95PerTile > 0, `z${a.z} has a rect p95`);
   }
+  const dr = manifest.densityRange;
+  check(Array.isArray(dr) && dr.length === 2 && dr[0] >= 0 && dr[1] > dr[0] && dr[1] <= 1,
+        `densityRange ${JSON.stringify(dr)}`);
   check(lod.hysteresis > 1.16, `hysteresis ${lod.hysteresis} must exceed one wheel notch (1.16x)`);
 
   // A level the ladder can never select is not written at all. Check that the
@@ -315,7 +325,11 @@ Promise.all([import('../src/lod.js'), import('../src/chip.js')]).then(([LOD, CHI
     check(!!doc.blocks[inst.block], `instance ${inst.i} references block ${inst.block}`);
     check(inst.box.maxX <= doc.chip.w && inst.box.maxY <= doc.chip.h,
           `instance ${inst.i} reaches outside the chip`);
-    for (const [x, y] of [[0, 0], [S, 0], [0, S], [S, S], [123457, 654321]]) {
+    // Corners plus an interior point, derived from the block size rather than
+    // fixed: a probe at fixed nanometres falls outside a small block, and the
+    // check then fails on data that is perfectly correct.
+    const inX = Math.round(S * 0.371), inY = Math.round(S * 0.613);
+    for (const [x, y] of [[0, 0], [S, 0], [0, S], [S, S], [inX, inY]]) {
       const cx = inst.T.toChipX(x, y), cy = inst.T.toChipY(x, y);
       const back = inst.T.toBlock(cx, cy);
       check(back[0] === x && back[1] === y, `instance ${inst.i} transform is not exactly invertible`);

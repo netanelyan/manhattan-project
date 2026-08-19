@@ -17,11 +17,30 @@ semiconductor world.
 No dependencies, no build step. Node for the generator, a browser for the viewer.
 
 ```sh
-node tools/gen.js --count 500k   # write data/ (0.3s, 333 tiles, 17.4 MB + chip.json)
-node tools/verify.js data        # check every invariant the viewer relies on
-node tools/bench.js data         # time the staging rebuild
-node tools/serve.js              # http://localhost:8080/src/
+make dev            # generate if needed, verify, serve -> http://localhost:8080/src/
+make help           # every target, with parameters
 ```
+
+`make` is not installed by default on Windows, so every target has an npm
+mirror, and both are the same code path (`tools/dev.js`) rather than two
+descriptions of the workflow that can drift:
+
+| make | npm | what |
+|---|---|---|
+| `make dev` | `npm run dev` | generate if needed, verify, serve |
+| `make gen` | `npm run gen` | generate `data/`, always |
+| `make big` | `npm run big` | generate at 50m x 70 blocks - the scale test |
+| `make block` | `npm run block` | generate a single block, no chip level |
+| `make verify` | `npm run verify` | check `data/` against every invariant |
+| `make serve` | `npm run serve` | serve, no regeneration |
+| `make bench` | `npm run bench` | time the visible-set update outside the browser |
+| `make clean` | `npm run clean` | remove `data/` |
+
+Parameters override: `make gen COUNT=20m BLOCKS=9`, or
+`npm run gen -- --count 20m --blocks 9`. Generation records what it was given,
+so `make dev` regenerates when the parameters change and skips when they have
+not — rebuilding 1.2 GB because someone typed `make serve` is not a good
+surprise. Generation always verifies what it wrote; `--no-verify` opts out.
 
 `--blocks N` sets how many times the chip places the block (70 by default,
 `--blocks 1` for a bare block), and `--block-orient none|rows|all` how they are
@@ -42,6 +61,9 @@ Viewer keys:
 | `a` | all layers on / off |
 | `c` | colour by layer or by cell class |
 | `t` | tile bounds and content boxes overlay |
+| `shift`+`1`-`9` | solo a layer, hide the rest |
+| `v` | per-layer alpha, see through the stack |
+| `b` | block instance outlines |
 | `p` | subpixel skip |
 | `r` | reset the worst-update timer |
 | `-` `=` | halve / double the tile cache budget |
@@ -105,6 +127,7 @@ are in [docs/tile-format.md](docs/tile-format.md).
 | `tools/layout.js` | synthetic layout: master library, density field, placement |
 | `tools/pyramid.js` | level planning, bucketing, the three tile builders |
 | `tools/format.js` | binary layout constants shared with the docs |
+| `tools/dev.js` | the workflow behind `make` and `npm run` |
 | `tools/verify.js` | reads the binaries back and checks every viewer invariant |
 | `tools/bench.js` | times the staging rebuild on real tiles, outside the browser |
 | `tools/serve.js` | static file server, core Node only |
