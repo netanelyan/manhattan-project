@@ -18,7 +18,8 @@ import { viewMasters, KIND_NAME, key, overflowKey } from './format.js';
 import { Camera, attachControls } from './camera.js';
 import { Renderer, LAYER_NAMES, TOGGLE_LAYERS } from './renderer.js';
 import { TileStore, PRIORITY } from './tiles.js';
-import { deriveLadder, LevelPicker } from './lod.js';
+import { deriveLadder, LevelPicker, viewOf } from './lod.js';
+import { Chip, singleInstance, rectToBlock } from './chip.js';
 
 const params = new URLSearchParams(location.search);
 const DATA = params.get('data') || '../data';
@@ -35,14 +36,28 @@ if (!gl) {
 }
 
 const cam = new Camera();
-let manifest = null, store = null, renderer = null;
+let manifest = null, store = null, renderer = null, chip = null, view = null;
 let levelByZ = new Map();
 let wantZ = 0, useZ = 0, clamped = false;
-let ladder = null, picker = null, auto = true;
-let visibleKeys = [], lastCandidates = 0;
+let ladder = null, picker = null, auto = true, chipNote = '';
+let visibleKeys = [], instanceDraws = [], lastCandidates = 0, uniqueTiles = 0;
 let status = 'loading...';
 
+let levelZs = [];                       // levels that exist, ascending
 const levelOf = z => levelByZ.get(z);
+
+// The pyramid can have gaps: the generator does not write a level that no zoom
+// could ever select, so z is not a dense range. Everything that moves between
+// levels moves through the list of the ones that exist.
+function nearestZ(z) {
+  let best = levelZs[0];
+  for (const v of levelZs) if (v <= z) best = v;
+  return best;
+}
+function stepZ(z, dir) {
+  const i = levelZs.indexOf(nearestZ(z)) + dir;
+  return levelZs[Math.min(levelZs.length - 1, Math.max(0, i))];
+}
 
 function resize() {
   cam.dpr = window.devicePixelRatio || 1;
@@ -60,17 +75,17 @@ function resize() {
 // not itself cause a switch.
 function buildLadder() {
   const z = picker ? picker.z : null;   // null on the first build: let the cold-start rule decide
-  ladder = deriveLadder(manifest, cam.resW, cam.resH, maxVisibleTiles);
+  view = viewOf(cam.resW, cam.resH, maxVisibleTiles, chip);
+  ladder = deriveLadder(manifest, view);
   picker = new LevelPicker(ladder, manifest.lod.hysteresis);
   picker.seed(z);
 }
 
-// Tile range covering the viewport, expanded by `margin` tiles and by the
-// level's content bleed. Overflow promotion is what keeps that bleed to one
-// standard cell rather than one macro.
-function tileRange(z, margin) {
+// Tile range covering `b` - a rect already in block coordinates - expanded by
+// `margin` tiles and by the level's content bleed. Overflow promotion is what
+// keeps that bleed to one standard cell rather than one macro.
+function tileRange(z, b, margin) {
   const L = levelOf(z);
-  const b = cam.bounds();
   const S = L.tileSize, over = L.maxOverhang || 0;
   return {
     x0: Math.max(0, Math.floor((b.minX - over) / S) - margin),
@@ -80,13 +95,30 @@ function tileRange(z, margin) {
   };
 }
 
-function candidates(z, margin = 0) {
-  const r = tileRange(z, margin);
+function candidates(z, b, margin = 0) {
+  const r = tileRange(z, b, margin);
   const out = [];
   for (let y = r.y0; y <= r.y1; y++)
     for (let x = r.x0; x <= r.x1; x++)
       if (store.exists(z, x, y)) out.push([x, y]);
   return out;
+}
+
+// What the camera justifies, per block instance. The viewport is transformed
+// into each instance's own block space - a rect stays a rect under all eight
+// orientations - and the tile range is then the same calculation it always was,
+// inside the one pyramid every instance shares.
+function instanceCandidates(z, margin = 0) {
+  const b = cam.bounds();
+  const out = [];
+  let total = 0;
+  for (const inst of chip.visible(b)) {
+    const list = candidates(z, rectToBlock(inst.T, b), margin);
+    if (!list.length) continue;
+    total += list.length;
+    out.push({ inst, list });
+  }
+  return { out, total };
 }
 
 // Level from the zoom, then stepped coarser until the tile count is sane. The
@@ -95,53 +127,84 @@ function candidates(z, margin = 0) {
 // than the ladder's rectangular estimate, not the usual path.
 function resolveLevel() {
   if (auto) wantZ = picker.pick(cam.scale);
-  let z = Math.min(wantZ, manifest.maxZ);
-  let c = candidates(z);
+  let z = nearestZ(Math.min(wantZ, manifest.maxZ));
+  let r = instanceCandidates(z);
   clamped = false;
-  while (z > 0 && c.length > maxVisibleTiles) { z--; c = candidates(z); clamped = true; }
-  return { z, c };
+  while (z > levelZs[0] && r.total > maxVisibleTiles) {
+    z = stepZ(z, -1); r = instanceCandidates(z); clamped = true;
+  }
+  return { z, r };
 }
 
 // Tell the store what the camera justifies, in priority order: the visible set
 // nearest the centre first, then a ring of neighbours. Then draw whatever has
 // already arrived. No awaiting anywhere on this path.
+//
+// A tile wanted by several block instances is requested ONCE - the key is
+// (z, x, y) inside the block, so the cache, the queue and the eviction list all
+// dedupe it for free. That is the whole payoff of instancing the block: 70
+// copies of a block cost one copy of its tiles.
 function refresh() {
   if (!renderer) return;
-  const { z, c } = resolveLevel();
+  const { z, r } = resolveLevel();
   useZ = z;
-  lastCandidates = c.length;
+  lastCandidates = r.total;
   const L = levelOf(z);
   const S = L.tileSize;
 
-  const want = [];
-  if (L.overflow) {
-    want.push({ key: overflowKey(z), url: store.overflowUrl(z), priority: PRIORITY.VISIBLE, dist: -1 });
-  }
+  const want = new Map();
+  const push = (k, url, priority, dist) => {
+    const prev = want.get(k);
+    if (prev) {
+      if (priority < prev.priority) { prev.priority = priority; prev.dist = dist; }
+      else if (priority === prev.priority && dist < prev.dist) prev.dist = dist;
+      return;
+    }
+    want.set(k, { key: k, url, priority, dist });
+  };
+
+  const ovf = L.overflow ? overflowKey(z) : null;
+  if (ovf) push(ovf, store.overflowUrl(z), PRIORITY.VISIBLE, -1);
 
   const inside = new Set();
-  for (const [x, y] of c) {
-    const k = key(z, x, y);
-    inside.add(k);
-    const dx = (x + 0.5) * S - cam.x, dy = (y + 0.5) * S - cam.y;
-    want.push({ key: k, url: store.urlFor(z, x, y), priority: PRIORITY.VISIBLE, dist: Math.hypot(dx, dy) });
+  instanceDraws = [];
+  for (const { inst, list } of r.out) {
+    const keys = new Set();
+    if (ovf) keys.add(ovf);                    // the level's overflow draws with every instance
+    for (const [x, y] of list) {
+      const k = key(z, x, y);
+      keys.add(k);
+      inside.add(k);
+      // Priority is distance in CHIP space: what is near the eye, not what is
+      // near the middle of some block.
+      const bx = (x + 0.5) * S, by = (y + 0.5) * S;
+      const dx = inst.T.toChipX(bx, by) - cam.x, dy = inst.T.toChipY(bx, by) - cam.y;
+      push(k, store.urlFor(z, x, y), PRIORITY.VISIBLE, Math.hypot(dx, dy));
+    }
+    instanceDraws.push({ inst, keys });
   }
   visibleKeys = [...inside];
+  uniqueTiles = inside.size;
 
   if (PREFETCH_RING > 0) {
-    for (const [x, y] of candidates(z, PREFETCH_RING)) {
-      const k = key(z, x, y);
-      if (inside.has(k)) continue;
-      const dx = (x + 0.5) * S - cam.x, dy = (y + 0.5) * S - cam.y;
-      want.push({ key: k, url: store.urlFor(z, x, y), priority: PRIORITY.PREFETCH, dist: Math.hypot(dx, dy) });
+    for (const { inst, list } of instanceCandidates(z, PREFETCH_RING).out) {
+      for (const [x, y] of list) {
+        const k = key(z, x, y);
+        if (inside.has(k)) continue;
+        const bx = (x + 0.5) * S, by = (y + 0.5) * S;
+        const dx = inst.T.toChipX(bx, by) - cam.x, dy = inst.T.toChipY(bx, by) - cam.y;
+        push(k, store.urlFor(z, x, y), PRIORITY.PREFETCH, Math.hypot(dx, dy));
+      }
     }
   }
 
-  store.request(want);
+  store.request([...want.values()]);
   apply();
 }
 
-// Hand the renderer everything that has actually arrived. Cheap to repeat:
-// setVisible reconciles, so unchanged tiles cost nothing.
+// Hand the renderer everything that has actually arrived, and the transforms to
+// draw it under. Cheap to repeat: setVisible reconciles, so unchanged tiles cost
+// nothing.
 function apply() {
   const L = levelOf(useZ);
   const wanted = new Map();
@@ -153,7 +216,10 @@ function apply() {
     const t = store.get(k);
     if (t) wanted.set(k, t);
   }
-  renderer.setVisible(wanted, cam);
+  const draws = instanceDraws.map(({ inst, keys }) => ({
+    m: inst.T.m, tx: inst.T.tx, ty: inst.T.ty, keys,
+  }));
+  renderer.setVisible(wanted, cam, draws);
   store.setPinned(new Set(wanted.keys()));
   store.evict();
 }
@@ -169,20 +235,38 @@ async function boot() {
   resize();
   const t0 = performance.now();
   manifest = await (await fetch(`${DATA}/manifest.json`)).json();
+
+  // The chip beside the block, if there is one. A viewer pointed at a bare
+  // block runs as a chip of one instance at the origin, so there is one path
+  // through everything below rather than two.
+  chip = singleInstance(manifest);
+  const chipUrl = params.get('chip') || `${DATA}/chip.json`;
+  try {
+    const res = await fetch(chipUrl);
+    if (res.ok) {
+      const doc = await res.json();
+      const single = doc.instances.filter(i => (i.block | 0) === 0);
+      if (single.length !== doc.instances.length) {
+        chipNote = `${doc.instances.length - single.length} instances of other blocks ignored`;
+      }
+      chip = new Chip({ ...doc, instances: single }, manifest.world.size);
+    }
+  } catch (e) { chipNote = 'chip.json: ' + e.message; }
   store = new TileStore(DATA, manifest, CACHE_MB);
   store.onTile = k => { if (k === overflowKey(useZ) || visibleKeys.includes(k)) scheduleApply(); };
   levelByZ = new Map(manifest.levels.map(l => [l.z, l]));
+  levelZs = manifest.levels.map(l => l.z).sort((a, b) => a - b);
   maxVisibleTiles = +(params.get('maxtiles') || manifest.lod.maxVisibleTiles);
   buildLadder();
 
   const masters = viewMasters(await (await fetch(`${DATA}/masters.bin`)).arrayBuffer());
   renderer = new Renderer(gl, masters, manifest.bucketCaps);
 
-  cam.fit(0, 0, manifest.die.w, manifest.die.h);
+  cam.fit(0, 0, chip.w, chip.h);
   // A partial pyramid (--one-tile) has no ladder to walk: only one level holds
   // tiles at all, so automatic choice would pick an empty one.
   auto = !manifest.partial && params.get('auto') !== '0';
-  if (params.has('z')) { wantZ = +params.get('z'); auto = false; }
+  if (params.has('z')) { wantZ = nearestZ(+params.get('z')); auto = false; }
   else if (!auto) wantZ = manifest.maxZ;
   const v = params.get('view');
   if (v) {
@@ -220,7 +304,7 @@ async function runPan(steps) {
   renderer.updateWorstMs = 0;
   for (let i = 0; i < steps; i++) {
     cam.x += step;
-    if (cam.x > manifest.world.size - L.tileSize) { cam.x = L.tileSize; cam.y += step; }
+    if (cam.x > chip.w - L.tileSize) { cam.x = L.tileSize; cam.y += step; }
     // Sample both applies: with a prefetch ring the tiles are usually already
     // cached, so the update lands in refresh()'s apply, not the one after
     // settle. Take the larger of the two.
@@ -262,7 +346,7 @@ async function runFling(steps) {
   const before = { ...store.stats };
   for (let i = 0; i < steps; i++) {
     cam.x += step;
-    if (cam.x > manifest.world.size - L.tileSize) { cam.x = L.tileSize; cam.y += step; }
+    if (cam.x > chip.w - L.tileSize) { cam.x = L.tileSize; cam.y += step; }
     refresh();
   }
   await store.settle();
@@ -289,7 +373,7 @@ const SWEEP_POS = [[0.5, 0.5], [0.3, 0.3], [0.7, 0.3], [0.3, 0.7], [0.7, 0.7]];
 
 async function runSweep() {
   const H = manifest.lod.hysteresis;
-  const fit = Math.min(cam.resW / manifest.die.w, cam.resH / manifest.die.h);
+  const fit = Math.min(cam.resW / chip.w, cam.resH / chip.h);
   const lo = fit / 2, hi = ladder[ladder.length - 1].minScale * H * 3;
 
   const walk = (from, to, step) => {
@@ -307,26 +391,33 @@ async function runSweep() {
   // the budget is a ceiling, not an average.
   const measure = async (z, scale) => {
     auto = false; wantZ = z; cam.scale = scale;
-    let rects = 0, tiles = 0, at = z, cl = false;
+    let rects = 0, tiles = 0, at = z, cl = false, insts = 0, uniq = 0;
     for (const [fx, fy] of SWEEP_POS) {
-      cam.x = manifest.die.w * fx; cam.y = manifest.die.h * fy;
+      cam.x = chip.w * fx; cam.y = chip.h * fy;
       refresh();
       await store.settle();
       apply();
       if (clamped) cl = true;
       at = useZ;
-      if (renderer.rectCount > rects) { rects = renderer.rectCount; tiles = renderer.resident.size; }
+      if (renderer.rectCount * instanceDraws.length > rects * Math.max(1, insts)) {
+        rects = renderer.rectCount; tiles = lastCandidates;
+        insts = instanceDraws.length; uniq = uniqueTiles;
+      }
     }
-    return { rects, tiles, clamped: cl, at };
+    return { rects, tiles, clamped: cl, at, insts, uniq };
   };
 
+  // rects is what one block's resident set holds; the chip draws it once per
+  // visible instance, so the on-screen figure is that times the instances.
   const side = (z, scale, m) =>
-    `z${z} ${levelOf(z).kind} ${fmt(m.rects)} rects / ${m.tiles} tiles ` +
-    `(est ${fmt(Math.round(picker.estimate(z, cam.resW, cam.resH, scale)))})` +
+    `z${z} ${levelOf(z).kind} ${fmt(m.rects * m.insts)} rects = ${fmt(m.rects)} x ${m.insts} blocks, ` +
+    `${m.tiles} tile draws from ${m.uniq} fetched ` +
+    `(est ${fmt(Math.round(picker.estimate(z, view, scale)))})` +
     (m.at !== z ? ` CLAMPED to z${m.at}` : '');
 
   report(`lod sweep  ${cam.resW}x${cam.resH} canvas dpr ${cam.dpr}, budget ${fmt(manifest.rectBudget)} rects, ` +
-         `hysteresis ${H}x, maxtiles ${maxVisibleTiles}, worst of ${SWEEP_POS.length} camera positions`);
+         `hysteresis ${H}x, maxtiles ${maxVisibleTiles}, worst of ${SWEEP_POS.length} camera positions, ` +
+         `chip ${chip.count} block instances (${chip.nx}x${chip.ny})`);
   report('  ladder   ' + ladder.map(p =>
     `z${p.z} ${p.minScale.toExponential(3)} (${p.bound})`).join('  |  '));
 
@@ -382,10 +473,10 @@ window.addEventListener('keydown', e => {
     case 'r': R.updateWorstMs = 0; break;
     case '-': store.budgetMB = Math.max(4, store.budgetMB / 2); break;
     case '=': case '+': store.budgetMB = store.budgetMB * 2; break;
-    case ']': auto = false; wantZ = Math.min(manifest.maxZ, useZ + 1); refresh(); break;
-    case '[': auto = false; wantZ = Math.max(0, useZ - 1); refresh(); break;
+    case ']': auto = false; wantZ = stepZ(useZ, +1); refresh(); break;
+    case '[': auto = false; wantZ = stepZ(useZ, -1); refresh(); break;
     case 'l': auto = !auto; picker.seed(useZ); refresh(); break;
-    case 'f': cam.fit(0, 0, manifest.die.w, manifest.die.h); refresh(); break;
+    case 'f': cam.fit(0, 0, chip.w, chip.h); refresh(); break;
   }
 });
 
@@ -433,16 +524,17 @@ function drawHud(dt) {
   const budget = manifest.rectBudget;
   const band = picker.band(useZ);
   const bound = (ladder.find(p => p.z === useZ) || {}).bound;
-  const est = picker.estimate(useZ, cam.resW, cam.resH, cam.scale);
+  const est = picker.estimate(useZ, view, cam.scale);
   const nmPerPx = 1 / cam.scale;
   const reqs = s.loaded + s.hits;
   hud.textContent =
 `LOD        z ${useZ} / ${manifest.maxZ}   ${KIND_NAME[R.kind]}   tile ${(L.tileSize / 1000).toFixed(1)}um   bleed ${(L.maxOverhang / 1000).toFixed(1)}um   ${auto ? 'auto' : 'MANUAL'}` +
   `${clamped ? `   (clamped from z${wantZ})` : ''}
 ladder     ${ladderLine()}   holds >= ${band[0].toExponential(2)}, switches in at ${band[1].toExponential(2)} (${bound})   est ${fmt(Math.round(est))} rects
-tiles      resident ${fmt(R.resident.size)}/${fmt(lastCandidates)}${L.overflow ? ` +ovf ${fmt(L.overflow.count)}` : ''}   inflight ${fmt(store.active)}  queued ${fmt(store.queue.length)}  loaded ${fmt(s.loaded)}  hit ${reqs ? (100 * s.hits / reqs).toFixed(0) : 0}%
+chip       ${fmt(R.instances.length)} / ${fmt(chip.count)} block instances on screen   draws ${fmt(R.drawCalls)}   ${chipNote}
+tiles      resident ${fmt(R.resident.size)}/${fmt(uniqueTiles)} unique, ${fmt(lastCandidates)} drawn${L.overflow ? ` +ovf ${fmt(L.overflow.count)}` : ''}   inflight ${fmt(store.active)}  queued ${fmt(store.queue.length)}  loaded ${fmt(s.loaded)}  hit ${reqs ? (100 * s.hits / reqs).toFixed(0) : 0}%
 cache      ${mb(store.bytes)} / ${store.budgetMB.toFixed(0)} MB  (pinned ${mb(store.pinnedBytes)})   evicted ${fmt(s.evicted)} = ${mb(s.evictedBytes)} MB   aborted ${fmt(s.aborted)}  dropped ${fmt(s.dropped)}
-placements ${fmt(R.instanceCount)}   rects ${fmt(R.rectCount)} / ${fmt(budget)} (${(100 * R.rectCount / budget).toFixed(0)}%)   submitted ${fmt(R.submittedRects)} (+${(100 * (R.submittedRects / Math.max(1, R.rectCount) - 1)).toFixed(0)}% bucket pad)
+placements ${fmt(R.instanceCount * R.instances.length)}   rects ${fmt(R.rectCount * R.instances.length)} / ${fmt(budget)} (${(100 * R.rectCount * R.instances.length / budget).toFixed(0)}%)   submitted ${fmt(R.submittedRects)} (+${(100 * (R.submittedRects / Math.max(1, R.rectCount) - 1)).toFixed(0)}% bucket pad)
 masters    ${fmt(R.distinctMasters)} distinct of ${fmt(R.masters.masterCount)} in library   draws ${fmt(R.drawCalls)}   buckets [${R.caps.join(',')}]
 update     last ${R.updateMs.toFixed(2)} ms (+${R.lastAdded}/-${R.lastRemoved} tiles)   worst ${R.updateWorstMs.toFixed(2)} ms   count ${fmt(R.updates)}   slot waste ${(100 * R.waste).toFixed(0)}%
 frame      ${dt.toFixed(2)} ms  (submit ${submitMs.toFixed(2)} ms)   fps(60) ${(1000 / avg).toFixed(1)}

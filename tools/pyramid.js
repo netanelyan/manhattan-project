@@ -363,7 +363,9 @@ function collectStructures(gen) {
   return { macros, straps };
 }
 
-function buildFarTile(mips, structures, z, tx, ty, tileSize, worldSize) {
+// The blocks one far tile holds, before any packing. Split out so the level
+// costing pass can count them without allocating a tile.
+function farTileBlocks(mips, structures, z, tx, ty, tileSize, worldSize) {
   const grid = F.BLOCK_GRID;
   const side = grid << z;
   const mip = mips[z];
@@ -391,6 +393,12 @@ function buildFarTile(mips, structures, z, tx, ty, tileSize, worldSize) {
   };
   for (const r of structures.macros) clip(r, F.ABSTRACT_LAYER.MACROBOX, F.BLOCK_KIND.MACRO);
   for (const r of structures.straps) clip(r, F.ABSTRACT_LAYER.POWERBOX, F.BLOCK_KIND.POWER);
+  return blocks;
+}
+
+function buildFarTile(mips, structures, z, tx, ty, tileSize, worldSize) {
+  const blocks = farTileBlocks(mips, structures, z, tx, ty, tileSize, worldSize);
+  const originX = tx * tileSize, originY = ty * tileSize;
 
   const n = blocks.length;
   const dataOff = F.T_HEADER_BYTES;
@@ -420,6 +428,64 @@ function buildFarTile(mips, structures, z, tx, ty, tileSize, worldSize) {
   return { buf, rectCount: n, bucketCount: 0, count: n };
 }
 
+// ---------------------------------------------------------------- costing
+// What a level costs to draw, per tile, computed from the placement list rather
+// than from tiles on disk. The LOD ladder has to be solved before anything is
+// written, because a level no zoom can ever select is not worth the disk - and
+// at a chip's scale that is not a rounding error.
+//
+// Exact, not an estimate: this counts what buildDeepTile / buildMidTile /
+// buildFarTile would put in each tile, promotion to the overflow list included.
+function levelRectCounts(gen, bucket, maxZ, L, oversize, mips, structures, worldSize) {
+  const side = 1 << L.z;
+  const out = new Int32Array(side * side);
+
+  if (L.kind === F.TILE_KIND.FAR) {
+    for (let Y = 0; Y < side; Y++)
+      for (let X = 0; X < side; X++)
+        out[Y * side + X] = farTileBlocks(mips, structures, L.z, X, Y, L.tileSize, worldSize).length;
+    return out;
+  }
+
+  const deep = L.kind === F.TILE_KIND.DEEP;
+  const { m } = gen.instances;
+  const masters = gen.masters;
+  const shift = maxZ - L.z;
+  for (let t = 0; t < bucket.nTiles; t++) {
+    const tx = t % bucket.tilesPerSide, ty = (t / bucket.tilesPerSide) | 0;
+    const idx = (ty >> shift) * side + (tx >> shift);
+    let r = 0;
+    for (let i = bucket.start[t], e = bucket.end[t]; i < e; i++) {
+      const mm = m[bucket.order[i]];
+      if (oversize[mm]) continue;
+      r += deep ? masters[mm].rectCount : 1;
+    }
+    out[idx] += r;
+  }
+  return out;
+}
+
+// The level's overflow list, costed the same way. It is resident whenever the
+// level is, so it is part of what the level costs on screen.
+function overflowCost(gen, mask, kind) {
+  const { m, n } = gen.instances;
+  const deep = kind === F.TILE_KIND.DEEP;
+  let count = 0, rects = 0;
+  for (let i = 0; i < n; i++) {
+    if (!mask[m[i]]) continue;
+    count++;
+    rects += deep ? gen.masters[m[i]].rectCount : 1;
+  }
+  return { count, rects };
+}
+
+// 95th percentile over non-empty tiles, the same statistic the kind assignment
+// uses for placement counts.
+function p95NonEmpty(counts) {
+  const v = Array.from(counts).filter(c => c > 0).sort((a, b) => a - b);
+  return v.length ? v[Math.min(v.length - 1, Math.floor(v.length * 0.95))] : 0;
+}
+
 // ---------------------------------------------------------------- coverage
 // Which tiles exist at a level, as a row-major bitmap (LSB first within each
 // byte). Cheaper than listing 16k coordinates in the manifest, and it lets the
@@ -433,6 +499,7 @@ function coverageBitmap(present, side) {
 module.exports = {
   bucketDeepest, collectTile, levelCounts, planLevels,
   oversizeMask, collectOverflow,
-  buildDeepTile, buildMidTile, buildFarTile, buildOverflowTile,
+  buildDeepTile, buildMidTile, buildFarTile, farTileBlocks, buildOverflowTile,
+  levelRectCounts, overflowCost, p95NonEmpty,
   buildDensityMips, collectStructures, coverageBitmap, orientedBox,
 };

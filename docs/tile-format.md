@@ -32,10 +32,14 @@ rejects a mismatch.
 
 ```
 data/
-  manifest.json          bootstrap metadata, the only text file
+  chip.json              block instances: the chip, as a list of transforms
+  manifest.json          bootstrap metadata for one block, the only text file
   masters.bin            cell master library, fetched once, resident forever
-  tiles/{z}/{x}/{y}.bin  quadtree pyramid, one file per tile
+  tiles/{z}/{x}/{y}.bin  quadtree pyramid for one block, one file per tile
 ```
+
+Everything below `chip.json` describes **one block**. The chip is N instances
+of it, placed and oriented - see "Block instances: the chip level".
 
 Tile `(z, x, y)` covers world nm `[x·S, (x+1)·S) × [y·S, (y+1)·S)` where
 `S = world.size / 2^z`. `world.size` is an exact multiple of `2^maxZ`, so `S` is
@@ -430,6 +434,10 @@ Bootstrap metadata. The only file parsed as text, fetched once.
 ```
 
 - `partial` is true when `--one-tile` was used and only a slice exists.
+- **`levels` can have gaps.** A level that no zoom can ever select is not
+  written, so `z` is not a dense range; `lod.shadowed` lists what was skipped.
+  Consumers must step through the levels that exist rather than assuming that
+  `z-1` is one of them.
 - `maxOverhang` is the furthest any tile at this level draws outside its own
   bounds. The viewer expands its cull rect by it, which makes tile-granularity
   culling exact despite bleed. Overflow promotion is what keeps it to one
@@ -443,6 +451,12 @@ Bootstrap metadata. The only file parsed as text, fetched once.
   `rectP95PerTile` is the same percentile of what a tile actually costs to
   draw, taken over the tiles as written, and it is what the runtime level
   choice budgets against.
+- `lod.solvedFor` is the block instance geometry the shipped ladder was solved
+  for: instance count, distinct positions per axis, pitch, block size. A viewer
+  with a different `chip.json` re-solves; this is what makes the shipped numbers
+  reproducible, and `tools/verify.js` checks them against it.
+- `lod.shadowed` lists levels the generator planned and then did not write,
+  because the next finer level takes over at the same scale.
 - `lod` holds the level-choice policy plus the ladder solved at `refView`.
   `switchPoints[z].minScale` is the lowest camera scale, in device px per nm,
   at which level `z` may be drawn, and `bound` names the constraint that set
@@ -519,13 +533,167 @@ aligns them to tile boundaries. Real tilers split long wires at tile borders for
 the same reason. Without that, tens of thousands of 25 µm strap segments
 straddled tile edges and landed in the overflow list for no benefit.
 
+## Block instances: the chip level
+
+The hierarchy is three deep, not two:
+
+```
+chip    ->  N block instances (block, x, y, orient)     chip.json
+block   ->  the tile pyramid                            tiles/{z}/{x}/{y}.bin
+master  ->  the cell library                            masters.bin
+```
+
+A block is parsed and tiled **once**. A chip that places it 70 times is 70
+transforms over that one pyramid — the same instancing the format already plays
+with masters, one level up. The 4,990,711-placement block instanced 70 times is
+349,349,770 placements at chip level; flattened it would be ~8.2 GB of tiles,
+instanced it is the block's 117 MB and a 70-entry list.
+
+The viewer takes the chip as a manifest and does not care where the manifest
+came from — a chip-level DEF, an assembly script, or a person writing it by
+hand. A viewer pointed at a block with no `chip.json` beside it runs as a chip
+of exactly one instance at the origin, so there is one code path, not two.
+
+### `chip.json`
+
+```json
+{
+  "version": 3,
+  "kind": "chip",
+  "name": "synthetic-70",
+  "blockSize": 2483200,
+  "chip": { "w": 22547456, "h": 20039424 },
+  "grid": { "cols": 9, "rows": 8, "pitch": 2508032, "gap": 24832, "orient": "rows" },
+  "orientNames": ["N", "S", "W", "E", "FN", "FS", "FW", "FE"],
+  "blocks": [
+    { "id": "core", "path": ".", "world": 2483200, "die": { "w": 2473800, "h": 2474000 }, "maxZ": 6 }
+  ],
+  "instances": [
+    { "block": 0, "x": 0, "y": 0, "orient": 0 },
+    { "block": 0, "x": 2508032, "y": 0, "orient": 0 }
+  ]
+}
+```
+
+- `instances` is the whole of it: a block index, a position in chip nanometres,
+  and one of the eight orientations. 16 bytes of meaning per instance, against
+  the tens of gigabytes it stands for.
+- `blocks[i].path` is where that block's `manifest.json`, `masters.bin` and
+  `tiles/` live, relative to `chip.json`. The synthetic chip points every
+  instance at the one block it was generated from.
+- `grid` is how the synthetic chip was laid out and is *not* read by the
+  viewer — it re-derives instance pitch from the placements themselves, because
+  a chip assembled from a DEF need not be a grid.
+- The block's own `manifest.json` is untouched by any of this. A block does not
+  know how many times it is placed.
+
+### The transform
+
+Orientation is the same eight-element set placements already use — N, S, E, W
+and their mirrors — so nothing new enters the format. Each is a point map on a
+square block of side `S`, written as a column-major 2×2 and an offset in units
+of `S`:
+
+| orient | x' | y' | m | t |
+|---|---|---|---|---|
+| N | x | y | `1,0,0,1` | `0,0` |
+| S | S−x | S−y | `-1,0,0,-1` | `1,1` |
+| W | S−y | x | `0,1,-1,0` | `1,0` |
+| E | y | S−x | `0,-1,1,0` | `0,1` |
+| FN | S−x | y | `-1,0,0,1` | `1,0` |
+| FS | x | S−y | `1,0,0,-1` | `0,1` |
+| FW | S−y | S−x | `0,-1,-1,0` | `1,1` |
+| FE | y | x | `0,1,1,0` | `0,0` |
+
+The offset is what puts the block's own box back at the origin after a flip, so
+a placed instance covers `[x, x+S] × [y, y+S]` whatever its orientation. Two
+consequences the rest of the design leans on:
+
+- **A rect stays a rect.** All eight maps are axis-preserving, so the viewport
+  transformed into an instance's block space is still an axis-aligned
+  rectangle, and tile culling runs unchanged inside the block.
+- **The inverse is exact.** Every entry is 0, ±1 and every offset is a whole
+  nanometre, so `toBlock(toChip(p)) == p` bit-for-bit. `tools/verify.js` checks
+  it on every instance, at the block corners and at an arbitrary interior point.
+
+### Fetched once, drawn N times
+
+Tile keys are `(z, x, y)` *inside the block*, so instances share every byte
+without the store knowing they exist: one entry in the cache, one request in the
+queue, one line in the eviction list. Nothing in `src/tiles.js` mentions chips.
+
+The renderer draws the resident set once per visible instance. The slot buffers
+are untouched between instances — an instance is two uniforms:
+
+- `u_tileBase`, its window into the per-tile origin table, which is indexed
+  `(instance, slot)` rather than `(slot)`. Each entry is that tile's origin
+  already transformed into chip space and made relative to the view origin, so
+  the f64 work stays on the CPU exactly as it did with one block.
+- `u_rot`, the 2×2 above, applied to tile-local coordinates in the vertex
+  shader.
+
+An entry also carries a validity flag: a tile that is resident because a
+*neighbouring* instance wants it collapses its vertices rather than drawing off
+screen.
+
+Measured at the full-chip view, 70 instances of a 5M-placement block:
+
+| | |
+|---|---|
+| tiles fetched | **1** |
+| tile draws | 70 |
+| draw calls | 70 (one per instance; the level is far, one call each) |
+| rectangles on screen | 73,500 = 1,050 × 70 |
+| GPU slot memory | 5.25 MB — one block's worth |
+| staging cost of a visible-set change | below the 0.01 ms timer |
+
+and one level down, where six blocks are on screen at `z2`: 16 tiles fetched, 50
+tile draws. Inside a single block nothing changes at all — 1 instance, 8 draw
+calls, exactly the numbers from before the chip existed.
+
+### Where it costs
+
+- **Draw calls scale with visible instances**, not with tiles: 70 at the chip
+  view, 8 (one per rect-count bucket) inside a block. That is the ladder's doing
+  — it refuses a level whose tile draws across all visible instances exceed the
+  rail, which is what keeps the chip view on one merged tile per block.
+- **Orientation is free relative to translate-only**, in the sense that matters:
+  the transform is applied unconditionally, so a chip of all-N instances runs
+  the same code as one cycling all eight. What it costs *at all* is 2 multiplies
+  and 2 adds per vertex, one `vec4` uniform per draw call, and one integer per
+  instance in the manifest. Rendering the same chip translate-only, mirrored by
+  rows, and cycling all eight orientations produced identical timings — all
+  below this setup's measurement resolution.
+- **The origin table is a rail.** It holds 4,096 `(instance, tile)` entries;
+  past that the furthest instances are dropped rather than the table corrupted.
+  The ladder's budget refuses those zooms long before, so the rail is a
+  backstop, not a policy.
+
+### Not implemented: more than one distinct block
+
+The format lists `blocks[]` and every instance names one, but the viewer loads a
+single master library and a single pyramid, and ignores instances of any other
+block (it says so in the HUD). A real multi-block chip needs one master texture
+and one slot-pool set per block, which is bookkeeping rather than a new idea.
+The 89 GB case that motivated this is one block, 70 times.
+
+---
+
 ## Choosing a level at runtime
 
 The generator decides what each level *is*. The viewer decides which one to
 draw, and it decides on the same two numbers — the rectangle budget and how many
 pixels a cell covers — so what reaches the screen is what the level was built
-for. The rule lives in `src/lod.js`; `[` and `]` still force a level by hand for
-debugging, and `l` returns to automatic.
+for. The rule lives in `src/lod.js`, which the generator imports rather than
+reimplements; `[` and `]` still force a level by hand for debugging, and `l`
+returns to automatic.
+
+**One ladder covers both levels of hierarchy.** A level's cost on screen is
+summed over the block instances the viewport touches, so the same rule that
+picks a level inside one block also picks the chip view: zoomed out far enough
+that dozens of blocks are visible, only the coarsest level of each block fits,
+and one merged tile per block *is* the chip view. There is no separate chip
+ladder and no chip-level pyramid.
 
 ### The ladder
 
@@ -535,31 +703,61 @@ whichever binds hardest, then forced monotone in `z`:
 
 | binds | the level is refused below the scale where … |
 |---|---|
-| `budget` | its tiles, plus its always-resident overflow list, fit `rectBudget` |
+| `budget` | its tiles across every visible instance, plus their overflow lists, fit `rectBudget` |
 | `cells` | a mean cell spans `minCellPx` — placement levels only |
-| `tiles` | at most `maxVisibleTiles` tiles are on screen |
+| `tiles` | at most `maxVisibleTiles` tile draws are on screen |
 
-A viewport of `resW × resH` device pixels at scale `s` covers
+With a viewport of `resW × resH` device pixels at scale `s`, covering
+`vw × vh` nanometres:
 
 ```
-tiles(z, s) = (resW / (tileSize(z)·s) + 1) · (resH / (tileSize(z)·s) + 1)
-rects(z, s) = tiles(z, s) · rectP95PerTile(z) + overflow.rectCount
+instances(s) = min(nx, vw/pitchX + 1) · min(ny, vh/pitchY + 1)
+perInstance  = min(tilesPerSide, min(vw, blockW)/tileSize + 1)
+               · min(tilesPerSide, min(vh, blockH)/tileSize + 1)
+tiles(z, s)  = instances(s) · perInstance
+rects(z, s)  = tiles(z, s) · rectP95PerTile(z) + instances(s) · overflow.rectCount
 ```
 
-and each constraint is one of those inverted for `s` — a quadratic in
-`u = 1 / (tileSize·s)`.
+Every cap in there earns its place. A viewport wider than the block pitch
+touches more instances, but never more than exist. A viewport wider than one
+block cannot see more of that block than the block has tiles — without that cap
+the ladder believes a single block can fill a screen with 128 tiles at every
+level, and every coarse level looks necessary when it is not. And the `+1` per
+axis is the partial tile hanging off each edge: not a rounding detail, it is why
+at equal zoom a coarse level draws **more** off-screen geometry than a fine one,
+and so why the ladder has to be forced monotone at all.
 
-The `+1` per axis is the partial tile hanging off each edge, and it is not a
-rounding detail: **at equal zoom a coarse level draws more off-screen geometry
-than a fine one**, because its edge tiles reach further outside the viewport. So
-for two levels of the same kind the *finer* one is the cheaper one to draw, and
-the ladder would not come out ordered on its own — hence the monotone pass, the
-same one kind assignment gets.
+Those caps also killed the closed form. `tiles(z, s)` is monotone in `s`, so each
+constraint is inverted by bisection with a fixed iteration count, which keeps the
+generator and the viewer bit-identical; `tools/verify.js` checks that the ladder
+the viewer derives reproduces the shipped one exactly.
 
 The `cells` bound is what keeps mid geometry off a full-die view. It is a
 property of the zoom alone, not of the level: a mean cell is `meanCellWidth · s`
 pixels wide wherever it is drawn from, and below `MIN_CELL_PX` an outline is the
 noise the spike found, while density blocks still carry the floorplan.
+
+### Levels that no zoom can select are not written
+
+After the monotone pass a level can end up sharing its switch-out scale with the
+next finer one, which then takes over the instant either becomes legal: the
+coarser level's window is empty. That is the normal outcome for the
+second-deepest level, because a finer level of the same kind is genuinely
+cheaper to draw at equal zoom. The generator solves the ladder **before** it
+writes anything — per-tile rectangle costs come from the placement list, not
+from tiles on disk — and skips those levels entirely. On the 5M design that is
+z5, 57.1 MB of 174.4 MB, written for nothing. `manifest.lod.shadowed` lists what
+was skipped and `tools/verify.js` checks the tiles really are absent.
+
+Dropping one level lowers the monotone floor for every finer level, which can
+empty another window, so the pass iterates to a fixpoint. The pyramid it leaves
+has gaps: `z` is not a dense range, and the viewer steps between the levels that
+exist.
+
+One consequence worth knowing: a shadowed level is also the natural *parent* for
+parent-while-loading (see Known constraints). Dropping z5 means the parent of
+the deepest level is the mid level, which is a coarser fallback but a legitimate
+one.
 
 ### Hysteresis
 
@@ -584,54 +782,58 @@ there until the camera moved.
 ### Switch points are data, not constants
 
 They follow from the design — tile sizes, and the p95 rectangle cost of a tile
-at each level — and from the window, since rectangles on screen scale with
-viewport area. A 3440×1440 canvas at `dpr` 2 costs 5.6× a 1920×1080 one at the
-same zoom, which is more than the whole gap between two levels. So the manifest
-ships the inputs, `manifest.lod.switchPoints` ships the ladder solved at a
-reference viewport for reference and for the docs, and the viewer re-solves
-against its real canvas at boot and on every resize. `tools/verify.js` checks
-that the viewer's copy of the rule reproduces the shipped ladder exactly, since
-two implementations of one rule drift.
+at each level — from the chip, since a level's cost is summed over visible
+instances, and from the window, since rectangles on screen scale with viewport
+area. A 3440×1440 canvas at `dpr` 2 costs 5.6× a 1920×1080 one at the same zoom,
+which is more than the whole gap between two levels.
+
+So the manifest ships the inputs, `manifest.lod.switchPoints` ships the ladder
+solved at a reference viewport for the chip the generator emitted, and
+`manifest.lod.solvedFor` records the instance geometry that was — while the
+viewer re-solves against its real canvas and its real `chip.json` at boot and on
+every resize. The same block viewed alone and viewed as 70 instances gets two
+different ladders from the same files, which is the point: seen alone, a block
+never needs a far mip below its own finest one, and `z1` and `z2` collapse to
+zero.
 
 ### Measured
 
 `?sweep=1` walks the zoom range through the real selector in both directions,
 records where the level actually changes, then parks the camera at each of those
 scales and reads the rectangle count the renderer is holding. 4,990,711
-placements, 3424×1345 canvas, worst of five camera positions:
+placements, 70 block instances, 3424×1345 canvas, worst of five camera
+positions:
 
-| switch | at px/nm | nm/px | cell px | before | after |
-|---|---|---|---|---|---|
-| in, z1→z2 | 4.410e-4 | 2268 | 0.31 | far, 3,931 rects / 4 tiles | far, 14,998 / 16 |
-| in, z2→z3 | 8.820e-4 | 1134 | 0.63 | far, 14,998 / 16 | far, 43,272 / 48 |
-| in, z3→z4 | 2.736e-3 | 365 | 1.95 | far, 13,600 / 15 | **mid, 798,822 / 41** |
-| in, z4→z6 | 7.569e-3 | 132 | 5.40 | mid, 179,106 / 9 | **deep, 876,767 / 73** |
-| out, z6→z4 | 5.793e-3 | 173 | 4.14 | **deep, 1,488,731 / 121** | mid, 312,554 / 16 |
-| out, z4→z3 | 2.094e-3 | 478 | 1.50 | **mid, 1,303,944 / 67** | far, 20,263 / 24 |
-| out, z3→z2 | 6.750e-4 | 1481 | 0.48 | far, 58,800 / 64 | far, 14,998 / 16 |
-| out, z2→z1 | 3.375e-4 | 2963 | 0.24 | far, 14,998 / 16 | far, 3,931 / 4 |
+| switch | at px/nm | cell px | before | after |
+|---|---|---|---|---|
+| in, z0→z1 | 2.443e-4 | 0.17 | far, 29,400 rects over 28 blocks, 28 draws / **1 fetched** | far, 110,068 over 28, 72 draws / 4 fetched |
+| in, z1→z2 | 6.333e-4 | 0.45 | far, 23,586 over 6, 15 draws / 4 fetched | far, 89,988 over 6, 50 draws / 16 fetched |
+| in, z2→z3 | 1.457e-3 | 1.04 | far, 21,610 over 2, 15 draws / 12 fetched | far, 54,498 over 2, 36 draws / 32 fetched |
+| in, z3→z4 | 3.350e-3 | 2.39 | far, 9,218 over 1, 10 draws | **mid, 683,130**, 32 draws |
+| in, z4→z6 | 8.222e-3 | 5.87 | mid, 195,960, 8 draws | **deep, 816,423**, 60 draws |
+| out, z6→z4 | 6.316e-3 | 4.51 | **deep, 1,531,094**, 112 draws | mid, 367,013, 15 draws |
+| out, z4→z3 | 2.574e-3 | 1.84 | **mid, 997,429**, 50 draws | far, 12,879, 15 draws |
+| out, z3→z2 | 1.113e-3 | 0.80 | far, 85,692 over 6, 40 draws / 16 fetched | far, 21,834 over 6, 12 draws / 4 fetched |
+| out, z2→z1 | 4.865e-4 | 0.35 | far, 119,984 over 8, 60 draws / 16 fetched | far, 31,448 over 8, 21 draws / 4 fetched |
+| out, z1→z0 | 1.867e-4 | 0.13 | far, 141,516 over 36, 96 draws / **4 fetched** | far, 37,800 over 36, 36 draws / **1 fetched** |
 
-The bold rows are the two that matter: the worst on-screen count anywhere in the
-sweep is 1,488,731 rectangles, at the deepest level just before it is given up,
-against a 2,000,000 budget — 74%, with the remainder absorbing the gap between
-the p95 estimate and a genuinely unlucky viewport. Nothing hit the
-`maxVisibleTiles` rail; the ladder gave the level up first, at 121 tiles.
+The worst on-screen count anywhere in the range is **1,531,094 rectangles of the
+2,000,000 budget (77%)**, at the deepest level just before it is given up. The
+five chip-level switches at the top of the range are the same rule doing the
+same job one level of hierarchy up — and the fetch column is the instancing
+payoff in one number: 96 tile draws from 4 fetched tiles, 36 from 1.
 
-The `cells` bound lands exactly where it was aimed: 1.50 px per cell leaving mid
-on the way out, 1.95 px arriving on the way in, the band being the 1.3×.
+The `cells` bound lands where it was aimed: 1.84 px per cell leaving mid on the
+way out, 2.39 px arriving on the way in, the gap being the 1.3× band.
 
 Two things the sweep shows that the ladder alone does not:
 
-- **z5 is never selected.** It shares z6's switch-out scale after the monotone
-  pass, so the finest deep level always wins — which is the `+1` again, z5's
-  coarser tiles hanging further off the edges. The level costs 57 MB and buys
-  nothing at runtime; `MAX_DEEP` could be 1 for this design.
-- **The estimate runs high at coarse levels** (est 135k against 15k measured at
-  z2). It assumes a full screen of tiles, and far levels have fewer tiles in
-  existence than the screen would hold. That is the right conservative
-  direction for a budget, and it is why the `tiles` bound rather than `budget`
-  is what selects among far levels — it is a mip-resolution rule wearing a fetch
-  rail's clothes.
+- **z5 is never selected, so it is never written.** It shares z6's switch-out
+  scale, because z6's finer tiles waste less area off the viewport edges.
+- **The estimate runs high at coarse levels** (est 134k against 22k measured at
+  z2 zooming out). It assumes a full screen of tiles per instance and every
+  instance fully in view; reality is partial blocks at the screen edge. That is
+  the conservative direction for a budget.
 
 ---
 
@@ -832,6 +1034,10 @@ per-level quantum in the contract, so it is not done.
 | prioritised on-demand loading, prefetch ring | done |
 | LRU eviction against a byte budget | done |
 | LOD level chosen from zoom | done — derived ladder with hysteresis, `[` / `]` / `l` override |
+| levels no zoom can select | done — solved before writing, skipped, listed in `lod.shadowed` |
+| block instances, chip level | done — `chip.json`, fetched once and drawn N times |
+| several distinct blocks in one chip | in the format, not in the viewer |
+| chip-level merged representation | next — coarser than one tile per block |
 | cross-fade between levels | not implemented — two opaque passes composited, see Known constraints |
 | translucent layers | not planned, see Known constraints |
 

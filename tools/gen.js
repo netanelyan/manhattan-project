@@ -11,6 +11,7 @@ const fs = require('fs');
 const path = require('path');
 const layout = require('./layout.js');
 const P = require('./pyramid.js');
+const C = require('./chip.js');
 const F = require('./format.js');
 
 // ---------------------------------------------------------------- cli
@@ -19,6 +20,7 @@ function parseArgs(argv) {
     count: 1000000, out: 'data', seed: 42, perTile: 4096,
     densityLo: 0.40, densityHi: 0.95, oneTile: false,
     buckets: F.DEFAULT_BUCKETS, strapAlign: false,
+    blocks: 70, blockOrient: 'rows', blockGap: 0.01,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -35,10 +37,21 @@ function parseArgs(argv) {
       case '--density':   { const v = next().split(':'); o.densityLo = +v[0]; o.densityHi = +v[1]; break; }
       case '--buckets':   o.buckets = +next(); break;
       case '--strap-align': o.strapAlign = true; break;
+      case '--blocks':    o.blocks = +next(); break;
+      case '--block-orient': o.blockOrient = next(); break;
+      case '--block-gap': o.blockGap = +next(); break;
       case '--one-tile':  o.oneTile = true; break;
       case '-h': case '--help': usage(); process.exit(0);
       default: console.error(`unknown flag ${a}`); usage(); process.exit(1);
     }
+  }
+  if (!(o.blocks >= 1 && o.blocks <= 4096)) {
+    console.error('--blocks must be between 1 and 4096');
+    process.exit(1);
+  }
+  if (!['none', 'rows', 'all'].includes(o.blockOrient)) {
+    console.error("--block-orient must be none, rows or all");
+    process.exit(1);
   }
   if (!(o.count >= 100000 && o.count <= 50000000)) {
     console.error('--count must be between 100k and 50M');
@@ -64,6 +77,9 @@ function usage() {
   --density LO:HI standard cell row density range                     [0.40:0.95]
   --buckets N     rect-count buckets to derive, = deep draw calls      [8]
   --strap-align   snap power straps to deepest-tile boundaries         [off]
+  --blocks N      block instances in the synthetic chip                [70]
+  --block-orient  none | rows (mirror alternate rows) | all            [rows]
+  --block-gap F   routing channel between blocks, as a fraction        [0.01]
   --one-tile      emit only the busiest deepest-level tile`);
 }
 
@@ -113,8 +129,13 @@ function writeMasters(dir, gen) {
 }
 
 // ---------------------------------------------------------------- main
-function main() {
+async function main() {
   const opts = parseArgs(process.argv.slice(2));
+  // The ladder and the block -> chip transform are the viewer's own modules,
+  // imported rather than reimplemented: they are the arithmetic both sides have
+  // to agree on exactly, and two copies would be two chances to disagree.
+  const LOD = await import('../src/lod.js');
+  const { Chip } = await import('../src/chip.js');
   const outDir = path.resolve(opts.out);
   fs.rmSync(path.join(outDir, 'tiles'), { recursive: true, force: true });
   fs.mkdirSync(outDir, { recursive: true });
@@ -188,6 +209,70 @@ function main() {
   console.log(`              ${(100 * cost.waste).toFixed(1)}% padding ` +
               `(fixed [8,16,32,64] would be ${(100 * F.capCost(gen.rectHist, [8, 16, 32, 64]).waste).toFixed(1)}%)`);
 
+  // --- what each level costs to draw, and which levels are worth writing.
+  //
+  // The ladder has to be solved before anything is written: a level whose
+  // window between its own switch-out scale and the next finer level's is empty
+  // can never be selected at any zoom, and writing it is disk nothing can read.
+  // Costs come from the placement list, not from tiles on disk, so this is
+  // decided without paying for it first.
+  const oversizeByLevel = levels.map(L =>
+    L.kind === F.TILE_KIND.FAR ? null : P.oversizeMask(gen.masters, L.tileSize));
+  const meanCellWidth = Math.round(gen.meanW);
+  const costs = levels.map((L, i) => {
+    const counts = P.levelRectCounts(gen, bucket, maxZ, L, oversizeByLevel[i], mips, structures, worldSize);
+    const ovf = oversizeByLevel[i] ? P.overflowCost(gen, oversizeByLevel[i], L.kind) : { count: 0, rects: 0 };
+    return { rectP95: P.p95NonEmpty(counts), ovf };
+  });
+  // The chip this block is instanced into. The ladder depends on it: a block's
+  // coarse levels earn their keep only when many blocks are on screen at once,
+  // which is exactly the chip view, and its deep levels are never seen more
+  // than one or two instances at a time. Built before anything is written, so
+  // a level no zoom can select is never written.
+  const chipDoc = C.buildChip(opts, {
+    version: F.VERSION, world: { size: worldSize }, die: { w: gen.dieW, h: gen.dieH }, maxZ,
+  });
+  const chipGeom = new Chip(chipDoc, worldSize);
+  const view = LOD.viewOf(F.REF_VIEW.w, F.REF_VIEW.h, F.MAX_VIS_TILES, chipGeom);
+  const lodManifest = {
+    rectBudget: F.RECT_BUDGET,
+    meanCellWidth,
+    lod: { minCellPx: F.MIN_CELL_PX },
+    levels: levels.map((L, i) => ({
+      z: L.z, kind: F.KIND_NAME[L.kind], tileSize: L.tileSize, tilesPerSide: L.tilesPerSide,
+      rectP95PerTile: costs[i].rectP95,
+      overflow: costs[i].ovf.count ? { rectCount: costs[i].ovf.rects } : null,
+    })),
+  };
+  // --one-tile is a round-trip check on one tile, not a pyramid; leave its
+  // level set alone or there would be nothing to check.
+  const sel = opts.oneTile
+    ? { keep: levels.map((_, i) => i), ladder: LOD.deriveLadder(lodManifest, view) }
+    : LOD.selectableLevels(lodManifest, view);
+  const keepIdx = new Set(sel.keep);
+  const dropped = levels.filter((_, i) => !keepIdx.has(i));
+  const switchPoints = sel.ladder;
+
+  console.log(`  lod ladder  ${F.REF_VIEW.w}x${F.REF_VIEW.h} reference viewport, ${fmt(opts.blocks)} block ` +
+              `instance${opts.blocks === 1 ? '' : 's'}; switch-in is ${F.LOD_HYSTERESIS}x switch-out, and the ` +
+              `columns are quoted at switch-out, where the level costs most`);
+  console.log('    z   kind   switch-out px/nm   nm/px   binds      blocks    tiles   rects on screen');
+  for (const p of switchPoints) {
+    const s0 = p.minScale;
+    const t = s0 > 0 ? LOD.tilesOnScreen(view, p.tilesPerSide, p.tileSize, s0) : null;
+    const r = t ? LOD.rectsOnScreen(view, p, s0) : null;
+    console.log(`    ${String(p.z).padStart(2)}  ${p.kind.padEnd(5)} ${s0.toExponential(3).padStart(15)} ` +
+      `${(s0 ? (1 / s0).toFixed(0) : '-').padStart(7)}   ${p.bound.padEnd(9)} ` +
+      `${(t ? t.instances.toFixed(1) : '-').padStart(7)} ${(t ? t.tiles.toFixed(1) : '-').padStart(8)} ` +
+      `${(r === null ? '-' : fmt(Math.round(r))).padStart(17)}`);
+  }
+  if (dropped.length) {
+    const saved = dropped.reduce((a, L) => a + (L.kind === F.TILE_KIND.FAR ? 0 : F.RECORD_BYTES[L.kind] * n), 0);
+    console.log(`                not written: ${dropped.map(L => 'z' + L.z + ' ' + F.KIND_NAME[L.kind]).join(', ')} ` +
+                `- no zoom can select ${dropped.length > 1 ? 'them' : 'it'}, the next finer level takes over at the ` +
+                `same scale (saves ~${mb(saved)})`);
+  }
+
   // --- write every level
   const tw = Date.now();
   const manifestLevels = [];
@@ -201,7 +286,9 @@ function main() {
     for (let i = 0; i < deepest.length; i++) if (deepest[i] > best) { best = deepest[i]; onlyTile = i; }
   }
 
-  for (const L of levels) {
+  for (let li = 0; li < levels.length; li++) {
+    const L = levels[li];
+    if (!keepIdx.has(li)) continue;
     const side = L.tilesPerSide;
     const present = new Uint8Array(side * side);
     let tiles = 0, bytes = 0, rects = 0, bucketsMax = 0, overhang = 0;
@@ -212,7 +299,7 @@ function main() {
     // into one overflow list per level. Without this a single macro sets the
     // level's content bleed and the viewer fetches an enormous ring of tiles.
     const abstract = L.kind === F.TILE_KIND.FAR;
-    const mask = abstract ? null : P.oversizeMask(gen.masters, L.tileSize);
+    const mask = oversizeByLevel[li];
     let overflow = null;
     if (mask) {
       const oidx = P.collectOverflow(gen, mask);
@@ -266,6 +353,14 @@ function main() {
     perTile.sort((a, b) => a - b);
     const rectP95 = perTile.length
       ? perTile[Math.min(perTile.length - 1, Math.floor(perTile.length * 0.95))] : 0;
+    // The ladder was solved from the costing pass, before any of this existed.
+    // If the two disagree the shipped switch points are wrong, so it is a hard
+    // failure rather than a warning.
+    if (!opts.oneTile && rectP95 !== costs[li].rectP95) {
+      console.error(`  costing pass disagrees with what was written at z${L.z}: ` +
+                    `${costs[li].rectP95} predicted, ${rectP95} actual`);
+      process.exit(1);
+    }
 
     manifestLevels.push({
       z: L.z,
@@ -290,38 +385,6 @@ function main() {
   }
   console.log(`  tiles       ${fmt(totalTiles)} written, ${mb(totalBytes)}, ${((Date.now() - tw) / 1000).toFixed(1)}s`);
 
-  // --- the LOD ladder: which level the viewer draws at which zoom.
-  //
-  // Derived, not tabulated, and from this design's own numbers - tile sizes and
-  // the p95 rectangle cost of a tile at each level - exactly as the bucket caps
-  // are derived from its rect-count histogram. Quoted here at a reference
-  // viewport; the viewer re-solves at its real canvas size, because the rect
-  // count on screen scales with viewport area and a 4K window is 3x a laptop.
-  const lodLevels = manifestLevels.map(L => ({
-    z: L.z, kind: L.kind, tileSize: L.tileSize,
-    rectsPerTile: L.rectP95PerTile,
-    overflowRects: L.overflow ? L.overflow.rectCount : 0,
-  }));
-  const meanCellWidth = Math.round(gen.meanW);
-  const switchPoints = F.deriveSwitchPoints(lodLevels, {
-    resW: F.REF_VIEW.w, resH: F.REF_VIEW.h,
-    rectBudget: F.RECT_BUDGET, minCellPx: F.MIN_CELL_PX,
-    meanCellWidth, maxTiles: F.MAX_VIS_TILES,
-  });
-
-  console.log(`  lod ladder  at the ${F.REF_VIEW.w}x${F.REF_VIEW.h} reference viewport; a level is switched IN at ` +
-              `${F.LOD_HYSTERESIS}x its switch-out scale, and the columns are quoted at switch-out, where it costs most`);
-  console.log('    z   kind   switch-out px/nm   nm/px   binds       tiles   rects on screen');
-  for (let i = 0; i < switchPoints.length; i++) {
-    const p = switchPoints[i], L = lodLevels[i];
-    const next = switchPoints[i + 1];
-    const shadowed = next && next.minScale <= p.minScale;
-    const s0 = p.minScale;
-    const t = s0 > 0 ? F.tilesOnScreen(F.REF_VIEW.w, F.REF_VIEW.h, L.tileSize, s0) : Infinity;
-    const r = t * L.rectsPerTile + L.overflowRects;
-    console.log(`    ${String(p.z).padStart(2)}  ${L.kind.padEnd(5)} ${s0.toExponential(3).padStart(15)} ${(s0 ? (1 / s0).toFixed(0) : '-').padStart(7)}   ${p.bound.padEnd(9)} ${(Number.isFinite(t) ? t.toFixed(1) : '-').padStart(7)} ${(Number.isFinite(r) ? fmt(Math.round(r)) : '-').padStart(17)}${shadowed ? '   (shadowed by z' + next.z + ')' : ''}`);
-  }
-
   const manifest = {
     version: F.VERSION,
     seed: opts.seed,
@@ -345,10 +408,16 @@ function main() {
       minCellPx: F.MIN_CELL_PX,
       maxVisibleTiles: F.MAX_VIS_TILES,
       hysteresis: F.LOD_HYSTERESIS,
+      solvedFor: {
+        instances: chipGeom.count, nx: chipGeom.nx, ny: chipGeom.ny,
+        pitchX: chipGeom.pitchX, pitchY: chipGeom.pitchY,
+        blockW: chipGeom.blockSize, blockH: chipGeom.blockSize,
+      },
       switchPoints: switchPoints.map(p => ({
         z: p.z, bound: p.bound,
         minScale: Number.isFinite(p.minScale) ? +p.minScale.toPrecision(6) : null,
       })),
+      shadowed: dropped.map(L => L.z),
     },
     bucketPadding: +cost.waste.toFixed(4),
     oversizeFrac: F.OVERSIZE_FRAC,
@@ -358,7 +427,19 @@ function main() {
     levels: manifestLevels,
   };
   fs.writeFileSync(path.join(outDir, 'manifest.json'), JSON.stringify(manifest, null, 2));
+
+  // --- the chip: N instances of the block that was just written.
+  //
+  // Nothing about the block depends on this. The block is tiled once and the
+  // chip is a list of transforms over it, which is the whole point: flattened,
+  // this chip would be ${n * blocks} placements and N times the bytes on disk.
+  fs.writeFileSync(path.join(outDir, 'chip.json'), JSON.stringify(chipDoc, null, 2));
+  const flatBytes = totalBytes * opts.blocks;
+  console.log(`  chip        ${fmt(opts.blocks)} instances of 1 block, ${chipDoc.grid.cols}x${chipDoc.grid.rows} grid, ` +
+              `orient ${opts.blockOrient}, ${um(chipDoc.chip.w)} x ${um(chipDoc.chip.h)} die`);
+  console.log(`              ${fmt(opts.blocks * n)} placements at chip level, in ${mb(totalBytes)} of tiles ` +
+              `(flattened it would be ~${mb(flatBytes)})`);
   console.log(`  -> ${outDir}`);
 }
 
-main();
+main().catch(e => { console.error(e); process.exit(1); });

@@ -17,13 +17,15 @@ semiconductor world.
 No dependencies, no build step. Node for the generator, a browser for the viewer.
 
 ```sh
-node tools/gen.js --count 500k   # write data/ (0.2s, 341 tiles, 18.5 MB)
+node tools/gen.js --count 500k   # write data/ (0.3s, 333 tiles, 17.4 MB + chip.json)
 node tools/verify.js data        # check every invariant the viewer relies on
 node tools/bench.js data         # time the staging rebuild
 node tools/serve.js              # http://localhost:8080/src/
 ```
 
-`--count` accepts 100k to 50M (`500k`, `1.5M`). 500k takes 0.3s and 17.5 MB; 5M
+`--blocks N` sets how many times the chip places the block (70 by default,
+`--blocks 1` for a bare block), and `--block-orient none|rows|all` how they are
+oriented. `--count` accepts 100k to 50M (`500k`, `1.5M`). 500k takes 0.3s and 17.5 MB; 5M
 takes 3.4s and 176 MB; a 50M design runs to about 1.2 GB, so check your disk
 before asking for one. The master library is 4,634 cells, matching a real
 `cells.lef`.
@@ -44,6 +46,23 @@ Viewer keys:
 | `r` | reset the worst-update timer |
 | `-` `=` | halve / double the tile cache budget |
 
+## Hierarchy
+
+Three levels, not two. A cell master is instanced into a block; a block is
+instanced into the chip:
+
+| | | |
+|---|---|---|
+| chip | N block instances (x, y, orientation) | `chip.json` |
+| block | millions of placements, as a tile pyramid | `tiles/{z}/{x}/{y}.bin` |
+| master | a few thousand cell definitions | `masters.bin` |
+
+A block is parsed and tiled once; the chip is a list of transforms over that
+one pyramid. The default synthetic chip places the generated block 70 times -
+349 million placements at chip level, in the 117 MB the block already cost,
+against ~8.2 GB flattened. At the full-chip view that is **one tile fetched and
+70 draws**: the instancing the renderer already does for masters, one level up.
+
 ## LOD
 
 The pyramid does not decimate, it changes representation - dropping small cells
@@ -58,7 +77,9 @@ pixels a cell covers:
 | **far** | merged density blocks, macros and power grid | n/a | one |
 
 The viewer picks its level from the zoom on the same basis, so what is drawn is
-what the level was built for. Each level's switch point is solved from this
+what the level was built for - and one ladder covers the chip too, because a
+level's cost is summed over the block instances on screen. Zoom out far enough
+and only the coarsest level of each block fits, which is exactly the chip view. Each level's switch point is solved from this
 design's tile sizes and per-tile rectangle cost and from the live canvas size -
 they are not constants, and a bigger window moves them - with a 1.3x hysteresis
 band so the level does not flicker when the camera parks on a boundary. On a
@@ -89,7 +110,9 @@ are in [docs/tile-format.md](docs/tile-format.md).
 | `tools/serve.js` | static file server, core Node only |
 | `src/` | the viewer: plain ES modules, WebGL2, no framework |
 | `src/slots.js` | the hot path: one tile to its GPU slot records |
-| `src/lod.js` | switch points from zoom, solved per design and per canvas |
+| `src/lod.js` | switch points from zoom, solved per design, chip and canvas |
+| `src/chip.js` | block instances and the block-to-chip transform |
+| `tools/chip.js` | the synthetic chip: N copies of the generated block |
 | `src/tiles.js` | prioritised fetch queue and LRU cache |
 | `src/pool.js` | persistent GPU slot buffer with a free list |
 | `spike/stress.html` | completed throughput experiment, frozen |

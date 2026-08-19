@@ -18,6 +18,15 @@
 // TEXTURES. masters.bin is uploaded verbatim as two RGBA32I textures - the
 // master table (2 texels per master: rectStart, rectCount, w, h / klass, rowH)
 // and the rect table (2 texels per rect). No CPU-side geometry expansion.
+//
+// BLOCK INSTANCES. A chip is N instances of one block, so the same resident
+// tiles are drawn once per visible instance: same slots, same buffers, one
+// extra uniform pair per draw. The per-tile table is indexed (instance, slot)
+// rather than (slot), and each entry is that tile's origin already transformed
+// into chip space and made relative to the view origin - so the f64 work stays
+// on the CPU exactly as it did with one block. Orientation rides along as a 2x2
+// of 0s and +/-1s applied to tile-local coordinates, which costs two multiplies
+// and two adds per vertex and nothing at all in bandwidth.
 
 import { RECT_TEX_WIDTH, TILE_KIND, I_STRIDE, KLASS,
          LAYER_CELLBOX, LAYER_MACROBOX, LAYER_POWERBOX } from './format.js';
@@ -41,7 +50,10 @@ const PALETTE = [
 export const TOGGLE_LAYERS = [2, 3, 4, 5, 6, 7, 8, 9, 11];
 
 const MAX_TILE_SLOTS = 1024;      // resident tiles addressable by the origin table
+const MAX_TILE_ENTRIES = 4096;    // (instance, tile) pairs the table can hold
 const TILE_TEX_WIDTH = 256;
+// One block instance drawn as itself: what a viewer with no chip beside it uses.
+const IDENTITY_INSTANCE = { m: [1, 0, 0, 1], tx: 0, ty: 0, keys: null };
 const LOG2_TEXW = Math.log2(RECT_TEX_WIDTH) | 0;
 
 // Shared shader preamble: master/rect lookup, the per-tile origin table, layer
@@ -58,6 +70,8 @@ uniform highp sampler2D  u_tiles;     // per-tile origin minus view origin
 uniform vec2  u_cam;
 uniform float u_scale;
 uniform vec2  u_res;
+uniform int   u_tileBase;             // this instance's window into the tile table
+uniform vec4  u_rot;                  // block orientation, column-major mat2
 uniform float u_minPx;
 uniform int   u_layerMask;
 uniform int   u_colorMode;            // 0 = by layer, 1 = by class
@@ -71,8 +85,15 @@ ivec4 fetchMaster(int i) {
 ivec4 fetchRect(int i) {
   return texelFetch(u_rects, ivec2(i & ${RECT_TEX_WIDTH - 1}, i >> ${LOG2_TEXW}), 0);
 }
-vec2 tileOrigin(int s) {
-  return texelFetch(u_tiles, ivec2(s & ${TILE_TEX_WIDTH - 1}, s >> 8), 0).xy;
+// xy: the tile's origin in chip space, relative to the view origin, for THIS
+// instance. z < 0 means the tile is not in this instance's visible set - it is
+// resident for another instance, so its geometry is dropped here.
+vec4 tileEntry(int s) {
+  s += u_tileBase;
+  return texelFetch(u_tiles, ivec2(s & ${TILE_TEX_WIDTH - 1}, s >> 8), 0);
+}
+vec2 blockRot(vec2 v) {
+  return vec2(u_rot.x * v.x + u_rot.z * v.y, u_rot.y * v.x + u_rot.w * v.y);
 }
 bool layerHidden(int layer) {
   return (u_layerMask & (1 << layer)) == 0;
@@ -81,8 +102,10 @@ int classLayer(int klass) {
   return klass == ${KLASS.MACRO} ? ${LAYER_MACROBOX}
        : klass == ${KLASS.PWR}   ? ${LAYER_POWERBOX} : ${LAYER_CELLBOX};
 }
-void emitQuad(vec2 world, vec2 size, vec2 corner, int layer, float density) {
-  vec2 p = (world + corner * size - u_cam) * u_scale + 0.5 * u_res;
+// Tile-local coordinates are rotated into the instance's orientation; the tile
+// origin is already transformed, on the CPU, in f64.
+void emitQuad(vec2 origin, vec2 local, vec2 size, vec2 corner, int layer, float density) {
+  vec2 p = (origin + blockRot(local + corner * size) - u_cam) * u_scale + 0.5 * u_res;
   float z = 1.0 - float(layer) * (1.0 / 16.0);
   gl_Position = vec4(p.x / u_res.x * 2.0 - 1.0, 1.0 - p.y / u_res.y * 2.0, z, 1.0);
   v_layer = layer;
@@ -103,6 +126,8 @@ const int QI[6] = int[6](0, 1, 2, 2, 1, 3);
 
 void main() {
   if (a_packed < 0) { discardVertex(); return; }        // released slot
+  vec4 tinfo = tileEntry(a_tileSlot);
+  if (tinfo.z < 0.0) { discardVertex(); return; }           // not visible for this instance
   int m = a_packed & 0xffff;
   int o = (a_packed >> 16) & 0xff;
 
@@ -134,8 +159,8 @@ void main() {
 
   int layer = u_colorMode == 1 ? classLayer(fetchMaster(m * 2 + 1).x) : e.x;
   int q = QI[gl_VertexID % 6];
-  vec2 world = tileOrigin(a_tileSlot) + vec2(a_pos) + vec2(float(ox), float(oy));
-  emitQuad(world, size, vec2(float(q & 1), float(q >> 1)), layer, 1.0);
+  vec2 local = vec2(a_pos) + vec2(float(ox), float(oy));
+  emitQuad(tinfo.xy, local, size, vec2(float(q & 1), float(q >> 1)), layer, 1.0);
 }`;
 
 // Mid: one quad per placement, the master's bounding box. Never touches the
@@ -148,6 +173,8 @@ layout(location=2) in int   a_tileSlot;
 
 void main() {
   if (a_packed < 0) { discardVertex(); return; }
+  vec4 tinfo = tileEntry(a_tileSlot);
+  if (tinfo.z < 0.0) { discardVertex(); return; }
   int m = a_packed & 0xffff;
   int o = (a_packed >> 16) & 0xff;
   ivec4 mi = fetchMaster(m * 2);
@@ -158,7 +185,7 @@ void main() {
   int layer = classLayer(fetchMaster(m * 2 + 1).x);
   if (layerHidden(layer)) { discardVertex(); return; }
   vec2 corner = vec2(float(gl_VertexID & 1), float((gl_VertexID >> 1) & 1));
-  emitQuad(tileOrigin(a_tileSlot) + vec2(a_pos), size, corner, layer, 1.0);
+  emitQuad(tinfo.xy, vec2(a_pos), size, corner, layer, 1.0);
 }`;
 
 // Far: pre-merged blocks that already carry their own size and density.
@@ -173,10 +200,12 @@ layout(location=4) in int   a_tileSlot;
 void main() {
   if (a_layer < 0) { discardVertex(); return; }
   if (layerHidden(a_layer)) { discardVertex(); return; }
+  vec4 tinfo = tileEntry(a_tileSlot);
+  if (tinfo.z < 0.0) { discardVertex(); return; }
   vec2 size = vec2(a_size);
   if (max(size.x, size.y) * u_scale < u_minPx) { discardVertex(); return; }
   vec2 corner = vec2(float(gl_VertexID & 1), float((gl_VertexID >> 1) & 1));
-  emitQuad(tileOrigin(a_tileSlot) + vec2(a_pos), size, corner, a_layer, a_density);
+  emitQuad(tinfo.xy, vec2(a_pos), size, corner, a_layer, a_density);
 }`;
 
 // Density modulates brightness, which is what turns a full-die view from
@@ -236,7 +265,8 @@ function link(gl, vs, fs, uniforms) {
 }
 
 const QUAD_U = ['u_cam', 'u_scale', 'u_res', 'u_minPx', 'u_palette',
-                'u_masters', 'u_rects', 'u_tiles', 'u_layerMask', 'u_colorMode'];
+                'u_masters', 'u_rects', 'u_tiles', 'u_layerMask', 'u_colorMode',
+                'u_tileBase', 'u_rot'];
 
 export class Renderer {
   constructor(gl, masters, caps) {
@@ -294,7 +324,13 @@ export class Renderer {
     this.resident = new Map();          // key -> { tile, tileSlot, allocs }
     this.freeTileSlots = [];
     for (let i = MAX_TILE_SLOTS - 1; i >= 0; i--) this.freeTileSlots.push(i);
-    this.tileOrigins = new Float32Array(MAX_TILE_SLOTS * 4);
+    // Indexed (instance, tileSlot): instance i's entry for slot s is at
+    // i * tileStride + s. The stride tracks the resident set rather than the
+    // slot ceiling, so 70 instances of a one-tile block cost 70 entries.
+    this.tileOrigins = new Float32Array(MAX_TILE_ENTRIES * 4);
+    this.instances = [IDENTITY_INSTANCE];
+    this.tileStride = 1;
+    this.instancesDropped = 0;
 
     this.scratch = new Int32Array(1 << 16);
     this.layerMask = 0xffff;
@@ -339,7 +375,7 @@ export class Renderer {
 
   _buildTileTexture() {
     const gl = this.gl;
-    const rows = MAX_TILE_SLOTS / TILE_TEX_WIDTH;
+    const rows = MAX_TILE_ENTRIES / TILE_TEX_WIDTH;
     const tex = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, tex);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
@@ -347,7 +383,7 @@ export class Renderer {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, TILE_TEX_WIDTH, rows, 0,
-                  gl.RGBA, gl.FLOAT, new Float32Array(MAX_TILE_SLOTS * 4));
+                  gl.RGBA, gl.FLOAT, new Float32Array(MAX_TILE_ENTRIES * 4));
     this.tileTex = tex;
     this.tileTexRows = rows;
   }
@@ -434,8 +470,6 @@ export class Renderer {
     }
 
     this.resident.set(key, { tile, tileSlot, allocs });
-    this.tileOrigins[tileSlot * 4] = tile.originX - this.originX;
-    this.tileOrigins[tileSlot * 4 + 1] = tile.originY - this.originY;
     this._account(tile, 1);
     return true;
   }
@@ -473,8 +507,10 @@ export class Renderer {
   }
 
   // Reconcile the resident set with what should be visible. `wanted` is a Map
-  // of key -> tile view, all of the same kind.
-  setVisible(wanted, cam) {
+  // of key -> tile view, all of the same kind, deduplicated across block
+  // instances: a tile shared by 70 instances is one entry, one slot, one fetch.
+  // `instances` is what to draw it as, each { m, tx, ty, keys }.
+  setVisible(wanted, cam, instances) {
     const t0 = performance.now();
     const resnap = this.needsResnap(cam) || this.resident.size === 0;
     if (resnap) { this.originX = cam.x; this.originY = cam.y; }
@@ -494,15 +530,11 @@ export class Renderer {
       if (this._addTile(key, tile)) added++;
     }
 
-    // Only the per-tile origin table depends on the view origin, and it is a
-    // few kilobytes. Nothing in the slot buffers is origin-relative.
-    if (resnap) {
-      for (const r of this.resident.values()) {
-        this.tileOrigins[r.tileSlot * 4] = r.tile.originX - this.originX;
-        this.tileOrigins[r.tileSlot * 4 + 1] = r.tile.originY - this.originY;
-      }
-    }
-    this._uploadTileOrigins();
+    // Only the per-tile origin table depends on the view origin or on where the
+    // instances sit, and it is a few kilobytes. Nothing in the slot buffers is
+    // origin-relative or instance-relative, which is what makes drawing the
+    // same tile N times cost N uniforms rather than N copies.
+    this._writeTileTable(instances || this.instances);
 
     this.updates++;
     this.lastAdded = added;
@@ -512,10 +544,41 @@ export class Renderer {
     return { added, resnap };
   }
 
-  _uploadTileOrigins() {
+  // One entry per (instance, resident tile): the tile's origin transformed into
+  // chip space and made relative to the view origin, in f64 here so the shader
+  // only ever sees small numbers. z carries whether this tile is in this
+  // instance's own visible set - a tile resident for a neighbour is skipped
+  // rather than drawn off-screen.
+  _writeTileTable(instances) {
+    let maxSlot = 0;
+    for (const r of this.resident.values()) if (r.tileSlot > maxSlot) maxSlot = r.tileSlot;
+    const stride = maxSlot + 1;
+
+    // Rail, not a policy: the ladder refuses levels long before this, and the
+    // alternative to dropping the furthest instances is corrupting the table.
+    let list = instances;
+    if (list.length * stride > MAX_TILE_ENTRIES) {
+      list = list.slice(0, Math.max(1, Math.floor(MAX_TILE_ENTRIES / stride)));
+    }
+    this.instancesDropped = instances.length - list.length;
+    this.instances = list;
+    this.tileStride = stride;
+
+    for (let i = 0; i < list.length; i++) {
+      const inst = list[i], m = inst.m, base = (i * stride) * 4;
+      for (const [key, r] of this.resident) {
+        const e = base + r.tileSlot * 4;
+        const ox = r.tile.originX, oy = r.tile.originY;
+        this.tileOrigins[e]     = m[0] * ox + m[2] * oy + inst.tx - this.originX;
+        this.tileOrigins[e + 1] = m[1] * ox + m[3] * oy + inst.ty - this.originY;
+        this.tileOrigins[e + 2] = !inst.keys || inst.keys.has(key) ? 1 : -1;
+      }
+    }
+
+    const rows = Math.min(this.tileTexRows, Math.ceil(list.length * stride / TILE_TEX_WIDTH));
     const gl = this.gl;
     gl.bindTexture(gl.TEXTURE_2D, this.tileTex);
-    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, TILE_TEX_WIDTH, this.tileTexRows,
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, TILE_TEX_WIDTH, Math.max(1, rows),
                      gl.RGBA, gl.FLOAT, this.tileOrigins);
   }
 
@@ -557,31 +620,47 @@ export class Renderer {
       gl.uniform1i(p.U.u_colorMode, this.colorMode);
     };
 
+    // The same slots, once per visible block instance. Nothing is re-uploaded
+    // between them: an instance is two uniforms, its window into the tile table
+    // and its orientation.
+    const perInstance = (p, body) => {
+      setup(p);
+      for (let i = 0; i < this.instances.length; i++) {
+        const inst = this.instances[i];
+        gl.uniform1i(p.U.u_tileBase, i * this.tileStride);
+        gl.uniform4f(p.U.u_rot, inst.m[0], inst.m[1], inst.m[2], inst.m[3]);
+        body();
+      }
+    };
+
     let calls = 0;
     if (this.kind === TILE_KIND.DEEP) {
-      setup(this.deep);
-      for (let b = 0; b < this.deepPools.length; b++) {
-        const pool = this.deepPools[b];
-        if (pool.highWater === 0) continue;
-        const entry = this._syncVao(this.deepVaos[b], pool, false);
-        gl.bindVertexArray(entry.vao);
-        gl.drawArraysInstanced(gl.TRIANGLES, 0, this.caps[b] * 6, pool.highWater);
-        calls++;
-      }
+      perInstance(this.deep, () => {
+        for (let b = 0; b < this.deepPools.length; b++) {
+          const pool = this.deepPools[b];
+          if (pool.highWater === 0) continue;
+          const entry = this._syncVao(this.deepVaos[b], pool, false);
+          gl.bindVertexArray(entry.vao);
+          gl.drawArraysInstanced(gl.TRIANGLES, 0, this.caps[b] * 6, pool.highWater);
+          calls++;
+        }
+      });
     } else if (this.kind === TILE_KIND.MID) {
       if (this.midPool.highWater > 0) {
-        setup(this.mid);
-        const entry = this._syncVao(this.midVao, this.midPool, false);
-        gl.bindVertexArray(entry.vao);
-        gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, this.midPool.highWater);
-        calls++;
+        perInstance(this.mid, () => {
+          const entry = this._syncVao(this.midVao, this.midPool, false);
+          gl.bindVertexArray(entry.vao);
+          gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, this.midPool.highWater);
+          calls++;
+        });
       }
     } else if (this.farPool.highWater > 0) {
-      setup(this.far);
-      const entry = this._syncVao(this.farVao, this.farPool, true);
-      gl.bindVertexArray(entry.vao);
-      gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, this.farPool.highWater);
-      calls++;
+      perInstance(this.far, () => {
+        const entry = this._syncVao(this.farVao, this.farPool, true);
+        gl.bindVertexArray(entry.vao);
+        gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, this.farPool.highWater);
+        calls++;
+      });
     }
 
     if (this.showTiles) calls += this._drawTileBounds(cam, camX, camY);
@@ -593,18 +672,30 @@ export class Renderer {
 
   _drawTileBounds(cam, camX, camY) {
     const gl = this.gl;
-    const n = this.resident.size;
+    const n = this.resident.size * this.instances.length;
     if (n === 0) return 0;
     const data = new Float32Array(n * 2 * 5);
     let w = 0;
-    for (const r of this.resident.values()) {
-      const t = r.tile;
-      const dx = t.originX - this.originX, dy = t.originY - this.originY;
-      data[w] = dx; data[w + 1] = dy; data[w + 2] = t.tileSize; data[w + 3] = t.tileSize;
-      data[w + 4] = 0; w += 5;
-      data[w] = dx + t.minX; data[w + 1] = dy + t.minY;
-      data[w + 2] = t.maxX - t.minX; data[w + 3] = t.maxY - t.minY;
-      data[w + 4] = 1; w += 5;
+    // Boxes are axis-aligned under every orientation, so the transform is two
+    // corners and a min/max rather than a rotated outline.
+    for (const inst of this.instances) {
+      const m = inst.m;
+      const put = (x0, y0, x1, y1, kind) => {
+        const ax = m[0] * x0 + m[2] * y0 + inst.tx - this.originX;
+        const ay = m[1] * x0 + m[3] * y0 + inst.ty - this.originY;
+        const bx = m[0] * x1 + m[2] * y1 + inst.tx - this.originX;
+        const by = m[1] * x1 + m[3] * y1 + inst.ty - this.originY;
+        data[w] = Math.min(ax, bx); data[w + 1] = Math.min(ay, by);
+        data[w + 2] = Math.abs(bx - ax); data[w + 3] = Math.abs(by - ay);
+        data[w + 4] = kind; w += 5;
+      };
+      for (const [key, r] of this.resident) {
+        if (inst.keys && !inst.keys.has(key)) { w += 10; continue; }
+        const t = r.tile;
+        put(t.originX, t.originY, t.originX + t.tileSize, t.originY + t.tileSize, 0);
+        put(t.originX + t.minX, t.originY + t.minY,
+            t.originX + t.maxX, t.originY + t.maxY, 1);
+      }
     }
     gl.bindVertexArray(this.lineVao);
     gl.bindBuffer(gl.ARRAY_BUFFER, this.lineBuf);

@@ -236,17 +236,25 @@ console.log(`total       ${totalTiles.toLocaleString()} tiles, ${(totalBytes / 1
 
 // ---------------------------------------------------------------- lod ladder
 //
-// The switch points shipped in the manifest are derived from the level table;
-// the viewer re-derives them from the same fields, in its own copy of the rule
-// (src/lod.js). Two implementations of one rule drift, so this checks that the
-// viewer's copy reproduces the shipped ladder exactly, and that the ladder
-// keeps the promises it is made of: ordered by z, inside the rectangle budget,
-// inside the tile rail.
-import('../src/lod.js').then(LOD => {
+// The switch points shipped in the manifest are derived from the level table
+// and from the chip the block is instanced into; the viewer re-derives them
+// from the same fields, with its own canvas, using this exact module. Checked
+// here against the geometry the manifest says it was solved for, so a drift
+// between what was shipped and what the viewer computes is a failure and not a
+// surprise in the field.
+Promise.all([import('../src/lod.js'), import('../src/chip.js')]).then(([LOD, CHIP]) => {
   const lod = manifest.lod;
   check(!!lod, 'manifest has a lod block');
   if (!lod) return;
-  const ref = LOD.deriveLadder(manifest, lod.refView.w, lod.refView.h, lod.maxVisibleTiles);
+  const sf = lod.solvedFor;
+  check(!!sf, 'lod block records the instance geometry it was solved for');
+  if (!sf) return;
+  const view = {
+    resW: lod.refView.w, resH: lod.refView.h, maxTiles: lod.maxVisibleTiles,
+    blockW: sf.blockW, blockH: sf.blockH, nx: sf.nx, ny: sf.ny,
+    pitchX: sf.pitchX, pitchY: sf.pitchY, instances: sf.instances,
+  };
+  const ref = LOD.deriveLadder(manifest, view);
   check(ref.length === lod.switchPoints.length, 'ladder length matches level count');
 
   let prev = -Infinity;
@@ -258,27 +266,69 @@ import('../src/lod.js').then(LOD => {
     // Compared at the precision the manifest ships, so this catches drift
     // between the two derivations and nothing else.
     const shipped = Number.isFinite(a.minScale) ? +a.minScale.toPrecision(6) : null;
-    check(shipped === b.minScale,
-          `ladder z${a.z} switch scale ${shipped} vs shipped ${b.minScale}`);
+    check(shipped === b.minScale, `ladder z${a.z} switch scale ${shipped} vs shipped ${b.minScale}`);
     check(a.minScale >= prev, `ladder z${a.z} not monotone in z`);
     prev = a.minScale;
 
     if (a.minScale > 0 && Number.isFinite(a.minScale)) {
-      const t = LOD.tilesOnScreen(lod.refView.w, lod.refView.h, L.tileSize, a.minScale);
-      const r = t * L.rectP95PerTile + (L.overflow ? L.overflow.rectCount : 0);
+      const t = LOD.tilesOnScreen(view, L.tilesPerSide, L.tileSize, a.minScale);
+      const r = LOD.rectsOnScreen(view, a, a.minScale);
       check(r <= manifest.rectBudget * 1.0001,
             `z${a.z} would draw ${Math.round(r)} rects at its own switch scale, budget ${manifest.rectBudget}`);
-      check(t <= lod.maxVisibleTiles * 1.0001,
-            `z${a.z} would need ${t.toFixed(1)} tiles at its own switch scale, rail ${lod.maxVisibleTiles}`);
+      check(t.tiles <= lod.maxVisibleTiles * 1.0001,
+            `z${a.z} would need ${t.tiles.toFixed(1)} tile draws at its own switch scale, rail ${lod.maxVisibleTiles}`);
     }
     check(L.tileCount === 0 || L.rectP95PerTile > 0, `z${a.z} has a rect p95`);
   }
   check(lod.hysteresis > 1.16, `hysteresis ${lod.hysteresis} must exceed one wheel notch (1.16x)`);
 
-  const shadowed = ref.filter((p, i) => ref[i + 1] && ref[i + 1].minScale <= p.minScale).map(p => p.z);
+  // A level the ladder can never select is not written at all. Check that the
+  // claim is true on disk, not just in the manifest.
+  for (const z of lod.shadowed || []) {
+    check(!manifest.levels.some(L => L.z === z), `shadowed z${z} still listed in levels`);
+    check(!fs.existsSync(path.join(DIR, 'tiles', String(z))), `shadowed z${z} still has tiles on disk`);
+  }
+
+  const stillShadowed = ref.filter((p, i) => ref[i + 1] && ref[i + 1].minScale <= p.minScale).map(p => p.z);
+  check(stillShadowed.length === 0, `levels written but never selectable: z${stillShadowed.join(', z')}`);
   console.log(`lod         ${ref.map(p => 'z' + p.z + ' ' + p.minScale.toExponential(2)).join('  ')}` +
               `  hysteresis ${lod.hysteresis}x` +
-              (shadowed.length ? `  (never selected: z${shadowed.join(', z')})` : ''));
+              ((lod.shadowed || []).length ? `  (not written: z${lod.shadowed.join(', z')})` : ''));
+
+  // ---------------------------------------------------------------- chip
+  //
+  // The block is tiled once; the chip is a list of transforms over it. What
+  // has to hold is that every instance lands inside the chip, that its
+  // transform is exactly invertible - the viewer inverts it on every frame to
+  // turn the viewport into block coordinates - and that the geometry matches
+  // what the ladder was solved for.
+  const chipPath = path.join(DIR, 'chip.json');
+  if (!fs.existsSync(chipPath)) return;
+  const doc = JSON.parse(fs.readFileSync(chipPath, 'utf8'));
+  check(doc.version === F.VERSION, `chip version ${doc.version}`);
+  check(doc.blockSize === manifest.world.size, 'chip blockSize matches the block world');
+  const chip = new CHIP.Chip(doc, manifest.world.size);
+  const S = manifest.world.size;
+  const orients = new Set();
+  for (const inst of chip.instances) {
+    orients.add(inst.orient);
+    check(!!doc.blocks[inst.block], `instance ${inst.i} references block ${inst.block}`);
+    check(inst.box.maxX <= doc.chip.w && inst.box.maxY <= doc.chip.h,
+          `instance ${inst.i} reaches outside the chip`);
+    for (const [x, y] of [[0, 0], [S, 0], [0, S], [S, S], [123457, 654321]]) {
+      const cx = inst.T.toChipX(x, y), cy = inst.T.toChipY(x, y);
+      const back = inst.T.toBlock(cx, cy);
+      check(back[0] === x && back[1] === y, `instance ${inst.i} transform is not exactly invertible`);
+      check(cx >= inst.box.minX && cx <= inst.box.maxX && cy >= inst.box.minY && cy <= inst.box.maxY,
+            `instance ${inst.i} maps block point outside its own box`);
+    }
+  }
+  check(chip.nx === sf.nx && chip.ny === sf.ny && chip.pitchX === sf.pitchX && chip.pitchY === sf.pitchY,
+        'ladder was solved for this chip geometry');
+  const flat = chip.count * manifest.instanceCount;
+  console.log(`chip        ${chip.count} instances (${chip.nx}x${chip.ny}), orientations ` +
+              `${[...orients].map(o => CHIP.ORIENT_NAME[o]).join('/')}, ` +
+              `${flat.toLocaleString()} placements flattened`);
 }).catch(e => {
   check(false, 'lod ladder: ' + e.message);
 }).finally(() => {
