@@ -28,7 +28,8 @@
 // of 0s and +/-1s applied to tile-local coordinates, which costs two multiplies
 // and two adds per vertex and nothing at all in bandwidth.
 
-import { RECT_TEX_WIDTH, TILE_KIND, I_STRIDE, KLASS,
+import { RECT_TEX_WIDTH, TILE_KIND, I_STRIDE, M_STRIDE, M_KLASS, M_RECT_START,
+         M_RECT_COUNT, B_STRIDE, B_LAYER, KLASS, CLASS_LAYER,
          LAYER_CELLBOX, LAYER_MACROBOX, LAYER_POWERBOX } from './format.js';
 import { SlotPool } from './pool.js';
 import { PLACEMENT_SLOT_I32, BLOCK_SLOT_I32, buildPlacementSlots, buildBlockSlots,
@@ -59,9 +60,28 @@ const PALETTE_SIZE = 20;
 export const TOGGLE_LAYERS = [2, 3, 4, 5, 6, 7, 8, 9, 11];
 export const CLASS_LAYER_NAMES = CLASS_NAMES;
 
+// Rectangles per master per abstract layer, counted once from masters.bin. It
+// is what turns a resident master reference count into "how many rectangles
+// does this mask actually draw" without walking a single placement.
+function perMasterLayerRects(masters) {
+  const out = new Int32Array(masters.masterCount * 16);
+  for (let m = 0; m < masters.masterCount; m++) {
+    const start = masters.masters[m * M_STRIDE + M_RECT_START];
+    const n = masters.masters[m * M_STRIDE + M_RECT_COUNT];
+    for (let r = 0; r < n; r++) out[m * 16 + (masters.rects[(start + r) * 8 + 4] & 15)]++;
+  }
+  return out;
+}
+
 const MAX_TILE_SLOTS = 1024;      // resident tiles addressable by the origin table
-const MAX_TILE_ENTRIES = 4096;    // (instance, tile) pairs the table can hold
 const TILE_TEX_WIDTH = 256;
+// (instance, tile) pairs the origin table can hold. It starts small and doubles
+// on demand, because the size it needs is (block instances on screen) x (tiles
+// resident), and neither is known until the camera is somewhere. The ceiling is
+// a real one - 1024 rows of RGBA32F is 4 MB - and it is never reached by any
+// level the ladder will select: the tile rail caps residency at a few hundred.
+const TILE_ENTRIES_MIN = 4096;
+const TILE_ENTRIES_MAX = TILE_TEX_WIDTH * 1024;
 // One block instance drawn as itself: what a viewer with no chip beside it uses.
 const IDENTITY_INSTANCE = { m: [1, 0, 0, 1], tx: 0, ty: 0, keys: null };
 const LOG2_TEXW = Math.log2(RECT_TEX_WIDTH) | 0;
@@ -392,12 +412,17 @@ export class Renderer {
     this.originY = 0;
     this.kind = TILE_KIND.FAR;
     this.resident = new Map();          // key -> { tile, tileSlot, allocs }
+    // Held in descending order so pop() hands back the LOWEST free index. Slot
+    // numbers are the stride of the origin table, so a slot left high up by a
+    // level that has since been left costs every instance an entry it does not
+    // use. Handing out 0, 1, 2... keeps the stride equal to the resident count.
     this.freeTileSlots = [];
     for (let i = MAX_TILE_SLOTS - 1; i >= 0; i--) this.freeTileSlots.push(i);
     // Indexed (instance, tileSlot): instance i's entry for slot s is at
     // i * tileStride + s. The stride tracks the resident set rather than the
     // slot ceiling, so 70 instances of a one-tile block cost 70 entries.
-    this.tileOrigins = new Float32Array(MAX_TILE_ENTRIES * 4);
+    this.tileOrigins = new Float32Array(TILE_ENTRIES_MIN * 4);
+    this.tileEntries = TILE_ENTRIES_MIN;
     this.instances = [IDENTITY_INSTANCE];
     this.tileStride = 1;
     this.instancesDropped = 0;
@@ -437,6 +462,72 @@ export class Renderer {
     // as tiles come and go. Recounting every placement on each tile arrival
     // would cost more than loading the tile.
     this._refs = new Int32Array(masters.masterCount);
+    this._farLayers = new Int32Array(16);
+    this._layerRects = perMasterLayerRects(masters);
+    this._klassLayer = new Int32Array(masters.masterCount);
+    for (let m = 0; m < masters.masterCount; m++) {
+      this._klassLayer[m] = CLASS_LAYER[masters.masters[m * M_STRIDE + M_KLASS]] || LAYER_CELLBOX;
+    }
+    this._counts = { placements: 0, rects: 0 };
+    this._countsDirty = true;
+    this._countsMask = -1;
+    this._countsKind = -1;
+  }
+
+  // ------------------------------------------------------- layer identity
+  //
+  // Only deep tiles carry process layers. Mid tiles are one box per placement
+  // and far tiles are merged density, macros and power: three abstract layers
+  // that say what a thing is, not which mask it is printed on. So "show me
+  // metal1" has no referent there, and applying the mask anyway means a layer
+  // key blanks the screen and calls it a filter.
+  //
+  // The filter is ignored at those levels rather than obeyed into an empty
+  // frame, and `layerFilterIgnored` is what puts that on screen. The
+  // alternative - forcing a level that has layers when someone presses a layer
+  // key - would move the camera in response to a display control, which is
+  // worse than saying no.
+  get hasLayerIdentity() { return this.kind === TILE_KIND.DEEP; }
+  get effectiveMask() { return this.hasLayerIdentity ? this.layerMask : 0xffff; }
+  get layerFilterIgnored() { return !this.hasLayerIdentity && this.layerMask !== 0xffff; }
+
+  // What is actually drawn, after the layer mask, not what happens to be
+  // resident. The two differ by everything a filter removes, and a rectangle
+  // count that ignores the filter makes every other number in the HUD suspect.
+  //
+  // Maintained from the same per-tile histograms residency already keeps, so
+  // this is a walk over the master library on a mask change, not over the
+  // placements on every frame.
+  get drawn() {
+    const mask = this.effectiveMask;
+    if (!this._countsDirty && this._countsMask === mask && this._countsKind === this.kind) {
+      return this._counts;
+    }
+    let placements = 0, rects = 0;
+    if (this.kind === TILE_KIND.FAR) {
+      for (let l = 0; l < 16; l++) {
+        if ((mask >> l) & 1) { placements += this._farLayers[l]; rects += this._farLayers[l]; }
+      }
+    } else if (this.kind === TILE_KIND.MID) {
+      for (let m = 0; m < this._refs.length; m++) {
+        const n = this._refs[m];
+        if (n && ((mask >> this._klassLayer[m]) & 1)) { placements += n; rects += n; }
+      }
+    } else {
+      const LR = this._layerRects;
+      for (let m = 0; m < this._refs.length; m++) {
+        const n = this._refs[m];
+        if (!n) continue;
+        let v = 0;
+        for (let l = 0; l < 16; l++) if ((mask >> l) & 1) v += LR[m * 16 + l];
+        if (v) { placements += n; rects += n * v; }
+      }
+    }
+    this._counts = { placements, rects };
+    this._countsDirty = false;
+    this._countsMask = mask;
+    this._countsKind = this.kind;
+    return this._counts;
   }
 
   // masters.bin's tables go to the GPU untouched apart from padding the last
@@ -457,9 +548,10 @@ export class Renderer {
     return { tex, bytes: padded.byteLength, rows };
   }
 
-  _buildTileTexture() {
+  _buildTileTexture(entries = TILE_ENTRIES_MIN) {
     const gl = this.gl;
-    const rows = MAX_TILE_ENTRIES / TILE_TEX_WIDTH;
+    const rows = entries / TILE_TEX_WIDTH;
+    if (this.tileTex) gl.deleteTexture(this.tileTex);
     const tex = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, tex);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
@@ -467,9 +559,25 @@ export class Renderer {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, TILE_TEX_WIDTH, rows, 0,
-                  gl.RGBA, gl.FLOAT, new Float32Array(MAX_TILE_ENTRIES * 4));
+                  gl.RGBA, gl.FLOAT, new Float32Array(entries * 4));
     this.tileTex = tex;
     this.tileTexRows = rows;
+    this.tileEntries = entries;
+  }
+
+  // Grow the origin table to hold `need` (instance, tile) entries, rounded up
+  // to whole texture rows and doubled so growth is not per-frame. Returns what
+  // it can actually address, which is the only place instances are ever
+  // dropped - and the HUD says so when it happens.
+  _ensureTileEntries(need) {
+    if (need <= this.tileEntries) return this.tileEntries;
+    if (this.tileEntries >= TILE_ENTRIES_MAX) return TILE_ENTRIES_MAX;
+    let n = this.tileEntries;
+    while (n < need && n < TILE_ENTRIES_MAX) n *= 2;
+    n = Math.min(n, TILE_ENTRIES_MAX);
+    this.tileOrigins = new Float32Array(n * 4);
+    this._buildTileTexture(n);
+    return n;
   }
 
   _placementVao(pool) {
@@ -570,15 +678,38 @@ export class Renderer {
       a.pool.release(a.off, a.n);
     }
     this._account(r.tile, -1);
-    this.freeTileSlots.push(r.tileSlot);
+    this._releaseTileSlot(r.tileSlot);
     this.resident.delete(key);
+  }
+
+  // Put a slot back where the descending order wants it, so the next allocation
+  // still gets the lowest free index. The list is at most MAX_TILE_SLOTS long
+  // and this runs once per tile leaving the visible set, next to work that
+  // rewrites that tile's whole slot range - the search is not the cost here.
+  _releaseTileSlot(slot) {
+    const f = this.freeTileSlots;
+    let lo = 0, hi = f.length;
+    while (lo < hi) {                      // first index with f[mid] < slot
+      const mid = (lo + hi) >> 1;
+      if (f[mid] > slot) lo = mid + 1; else hi = mid;
+    }
+    f.splice(lo, 0, slot);
   }
 
   // Fold one tile into (sign +1) or out of (sign -1) the running totals.
   _account(t, sign) {
     this.instanceCount += sign * t.count;
     this.rectCount += sign * t.rectCount;
-    if (t.kind === TILE_KIND.FAR) { this.submittedRects += sign * t.count; return; }
+    this._countsDirty = true;
+    if (t.kind === TILE_KIND.FAR) {
+      this.submittedRects += sign * t.count;
+      // A far block carries its own layer, so what a layer mask would keep is a
+      // histogram maintained the same way the master references are - once per
+      // tile arriving or leaving, never per frame.
+      const b = t.blocks;
+      for (let i = 0; i < t.count; i++) this._farLayers[b[i * B_STRIDE + B_LAYER] & 15] += sign;
+      return;
+    }
     if (t.kind === TILE_KIND.MID) this.submittedRects += sign * t.count;
     else for (const b of tileBuckets(t)) this.submittedRects += sign * b.count * this.caps[b.bucket];
     const refs = this._refs;
@@ -635,19 +766,26 @@ export class Renderer {
   // instance's own visible set - a tile resident for a neighbour is skipped
   // rather than drawn off-screen.
   _writeTileTable(instances) {
-    let maxSlot = 0;
+    let maxSlot = -1;
     for (const r of this.resident.values()) if (r.tileSlot > maxSlot) maxSlot = r.tileSlot;
     const stride = maxSlot + 1;
 
-    // Rail, not a policy: the ladder refuses levels long before this, and the
-    // alternative to dropping the furthest instances is corrupting the table.
+    // The table grows to what the camera actually justifies. It used to be a
+    // fixed 4096 entries against a stride taken from the highest slot index in
+    // use, and slots were handed out from a LIFO free list - so one leftover
+    // high slot inflated the stride, the product overran the table, and whole
+    // block instances were dropped from the visible set with nothing on screen
+    // to say so. Slots are compact now and the table grows; this is the rail
+    // behind both, and it reports rather than truncating in silence.
+    const cap = this._ensureTileEntries(instances.length * stride);
     let list = instances;
-    if (list.length * stride > MAX_TILE_ENTRIES) {
-      list = list.slice(0, Math.max(1, Math.floor(MAX_TILE_ENTRIES / stride)));
+    if (stride > 0 && list.length * stride > cap) {
+      list = list.slice(0, Math.max(1, Math.floor(cap / stride)));
     }
     this.instancesDropped = instances.length - list.length;
     this.instances = list;
     this.tileStride = stride;
+    if (stride === 0) return;               // nothing resident: nothing to index
 
     for (let i = 0; i < list.length; i++) {
       const inst = list[i], m = inst.m, base = (i * stride) * 4;
@@ -727,7 +865,7 @@ export class Renderer {
       gl.depthMask(true);
       gl.disable(gl.BLEND);
     } else {
-      calls += this._drawSet(setup, this.layerMask);
+      calls += this._drawSet(setup, this.effectiveMask);
     }
 
     if (this.selectionBox) calls += this._drawSelection(cam, camX, camY);
@@ -744,8 +882,9 @@ export class Renderer {
   layerPasses() {
     const lo = this.kind === TILE_KIND.DEEP ? 0 : LAYER_CELLBOX;
     const hi = this.kind === TILE_KIND.DEEP ? LAYER_CELLBOX - 1 : LAYER_POWERBOX;
+    const mask = this.effectiveMask;
     const out = [];
-    for (let l = lo; l <= hi; l++) if ((this.layerMask >> l) & 1) out.push(l);
+    for (let l = lo; l <= hi; l++) if ((mask >> l) & 1) out.push(l);
     return out;
   }
 

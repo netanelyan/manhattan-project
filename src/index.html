@@ -6,7 +6,7 @@
 <style>
   html, body { margin: 0; height: 100%; background: #0e0e10; overflow: hidden; }
   canvas { display: block; width: 100vw; height: 100vh; cursor: grab; }
-  #hud, #panel, #bar {
+  #hud, #panel, #bar, #help, #notice {
     color: #9fd49f; font: 12px/1.55 Consolas, "DejaVu Sans Mono", monospace;
     background: rgba(0, 0, 0, .58); padding: 8px 12px; border: 1px solid #24301f;
   }
@@ -14,6 +14,24 @@
     position: fixed; top: 10px; left: 10px;
     white-space: pre; pointer-events: none;
   }
+  #hud.off { display: none; }
+  /* Things that would otherwise be silent: a filter that cannot apply here, a
+     visible-set the renderer could not fit. They outlive the HUD on purpose -
+     turning the diagnostics off must not turn the warnings off with them. */
+  #notice {
+    position: fixed; bottom: 10px; right: 10px; max-width: 44vw;
+    white-space: pre-wrap; pointer-events: none; display: none;
+    color: #e6c27a; border-color: #4a3c1c; background: rgba(24, 16, 0, .82);
+  }
+  #notice.on { display: block; }
+  #help {
+    position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
+    white-space: pre; display: none; max-height: 86vh; overflow: auto;
+    padding: 14px 20px; background: rgba(0, 0, 0, .86);
+  }
+  #help.on { display: block; }
+  #help b { color: #cfe9cf; font-weight: normal; }
+  #help i { color: #6f9a6f; font-style: normal; }
   /* Selection and jump-to sit at the bottom, out of the HUD's way, and look
      like the HUD rather than like a framework arrived. */
   #panel {
@@ -37,6 +55,8 @@
 <body>
 <canvas id="c"></canvas>
 <div id="hud">loading...</div>
+<div id="notice"></div>
+<div id="help"></div>
 <div id="panel"></div>
 <div id="bar"><label for="jump">go to x, y nm&nbsp;</label><input id="jump" spellcheck="false"
   placeholder="482100, 918400"><span class="note">&nbsp;&nbsp;enter, esc</span></div>

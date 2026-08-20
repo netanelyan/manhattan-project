@@ -3,6 +3,7 @@
 # Git Bash on Windows, for one) still has the whole workflow through npm.
 #
 #   make dev                     generate if needed, verify, serve
+#   make check                   drive the viewer headless and fail on an empty frame
 #   make gen COUNT=20m BLOCKS=9  parameters override on the command line
 #
 # No GNU extensions, no shell built-ins, forward slashes only.
@@ -34,6 +35,9 @@ block:
 verify:
 	@$(DEV) verify $(ARGS)
 
+check:
+	@$(DEV) check $(ARGS)
+
 serve:
 	@$(DEV) serve $(ARGS)
 
@@ -43,4 +47,4 @@ bench:
 clean:
 	@$(DEV) clean $(ARGS)
 
-.PHONY: help dev gen big block verify serve bench clean
+.PHONY: help dev gen big block verify check serve bench clean

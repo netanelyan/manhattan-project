@@ -788,6 +788,30 @@ property of the zoom alone, not of the level: a mean cell is `meanCellWidth · s
 pixels wide wherever it is drawn from, and below `MIN_CELL_PX` an outline is the
 noise the spike found, while density blocks still carry the floorplan.
 
+### The floor, and where it actually stops
+
+The coarsest level takes `minScale = 0`, bound `floor`: something must always
+draw, so the level of last resort has no lower end of its own. That leaves the
+question of where the lower end really is, and the answer is not in the ladder at
+all — it is the camera. Zooming out is clamped at fit-to-die (`MIN_ZOOM_FILL` of
+the viewport, in `src/camera.js`), because there is nothing outside the die to
+navigate to and every map application stops at whole-world.
+
+Without that clamp the floor level applies however far out the camera goes, and
+a far level has no `cells` bound to stop it: at 1.17e-5 px/nm a z0 density block
+is 0.9 pixels across and the density map is noise, where at 3.34e-5 it is 2.6
+pixels and reads correctly. So each ladder entry also carries `contentScale` —
+the scale at which that level's own smallest feature spans `MIN_CELL_PX`, a mean
+cell for the placement levels and a density block (`tileSize / blockGrid`) for
+the far ones — and the floor entry carries `floorSlack`, its `contentScale`
+divided by the lowest scale the camera can reach. Above 1 the floor level is
+reachable below what its content was built for, and the HUD's ladder line says
+so rather than leaving it as an unwritten edge case.
+
+`contentScale` is reported, never selected on: feeding it into `minScale` for the
+far levels would move switch points that the pyramid on disk was already written
+against.
+
 ### Levels that no zoom can select are not written
 
 After the monotone pass a level can end up sharing its switch-out scale with the

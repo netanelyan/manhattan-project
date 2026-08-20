@@ -6,9 +6,12 @@
 // here blocks the frame - the viewer draws whatever has arrived and picks up
 // the rest as it lands.
 //
-// Eviction is LRU by last use, with the currently visible set pinned. A tile
-// the renderer still holds slots for must never be evicted, so `pin` is the
-// renderer's residency set, not a guess.
+// Eviction is LRU by last use, with the currently visible set pinned. `pin` is
+// what the camera justifies right now, set when the request is made rather than
+// after the frame is drawn - eviction runs as tiles land, which is before any
+// frame has had the chance to declare them. The keys are block-space, so a tile
+// shared by seventy block instances is one pinned key, and eviction cannot drop
+// something another instance is still drawing.
 
 import { viewTile, key, overflowKey, decodeCoverage } from './format.js';
 

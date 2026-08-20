@@ -32,6 +32,7 @@ descriptions of the workflow that can drift:
 | `make big` | `npm run big` | generate at 50m x 70 blocks - the scale test |
 | `make block` | `npm run block` | generate a single block, no chip level |
 | `make verify` | `npm run verify` | check `data/` against every invariant |
+| `make check` | `npm run check` | drive the viewer headless; fail on an empty frame |
 | `make serve` | `npm run serve` | serve, no regeneration |
 | `make bench` | `npm run bench` | time the visible-set update outside the browser |
 | `make clean` | `npm run clean` | remove `data/` |
@@ -49,27 +50,38 @@ takes 3.4s and 176 MB; a 50M design runs to about 1.2 GB, so check your disk
 before asking for one. The master library is 4,634 cells, matching a real
 `cells.lef`.
 
-Viewer keys:
+Viewer keys - `?` or `h` in the viewer lists them, grouped, and does not
+disappear when the HUD does:
 
-| key | |
-|---|---|
-| drag / wheel | pan, zoom |
-| `l` | automatic / manual LOD level |
-| `[` `]` | force the level down / up (switches to manual) |
-| `f` | fit the die |
-| `1`-`9` | toggle a layer |
-| `a` | all layers on / off |
-| `c` | colour by layer or by cell class |
-| `t` | tile bounds and content boxes overlay |
-| click | identify what is under the cursor |
-| `g` | go to an `x, y` coordinate in nm |
-| `esc` | dismiss the panel or the coordinate box |
-| `shift`+`1`-`9` | solo a layer, hide the rest |
-| `v` | per-layer alpha, see through the stack |
-| `b` | block instance outlines |
-| `p` | subpixel skip |
-| `r` | reset the worst-update timer |
-| `-` `=` | halve / double the tile cache budget |
+| | key | |
+|---|---|---|
+| navigate | drag / wheel | pan, zoom - zooming out stops at fit-to-die |
+| | `f` | fit the die |
+| | `g` | go to an `x, y` coordinate in nm |
+| | click | identify what is under the cursor |
+| | `esc` | dismiss the panel or the coordinate box |
+| level | `l` | automatic / manual LOD level |
+| | `[` `]` | force the level down / up (switches to manual) |
+| layers | `1`-`9` | toggle a layer |
+| | `shift`+`1`-`9` | solo a layer, hide the rest |
+| | `a` | all layers on / off |
+| | `v` | per-layer alpha, see through the stack |
+| display | `d` | HUD: full / one line / off |
+| | `?` `h` | the key list |
+| | `c` | colour by layer or by cell class |
+| | `b` | block instance outlines |
+| | `p` | subpixel skip |
+| diagnostics | `t` | tile bounds and content boxes overlay |
+| | `r` | reset the worst-update timer |
+| | `-` `=` | halve / double the tile cache budget |
+
+Layer filters apply where layers exist. A deep tile carries real process layers;
+mid and far tiles carry three abstract ones - one box per placement, or merged
+density, macros and the power grid - which say what a thing is, not which mask
+it is printed on. So a layer key has no referent there. The filter is ignored
+rather than obeyed into an empty frame, and the viewer says so on screen instead
+of leaving you to work out why `shift`+`5` blanked the die. `]` steps to a level
+that does have layers.
 
 ## Hierarchy
 
@@ -102,6 +114,7 @@ pan - and loading it restores exactly what was on screen:
 | `solo=8` | soloed layer, with `mask` carrying what to return to |
 | `color=1` | colour by cell class rather than by layer |
 | `alpha=1` | per-layer alpha |
+| `hud=line` `hud=off` | how much of the HUD is showing |
 | `pick=x,y` | the selected placement, so "come look at this" means *this* |
 
 That is the one thing a desktop layout viewer structurally cannot do: paste a
@@ -151,6 +164,7 @@ are in [docs/tile-format.md](docs/tile-format.md).
 | `tools/format.js` | binary layout constants shared with the docs |
 | `tools/dev.js` | the workflow behind `make` and `npm run` |
 | `tools/verify.js` | reads the binaries back and checks every viewer invariant |
+| `tools/check.js` | drives the viewer headless: the runtime gate above |
 | `tools/bench.js` | times the staging rebuild on real tiles, outside the browser |
 | `tools/serve.js` | static file server, core Node only |
 | `src/` | the viewer: plain ES modules, WebGL2, no framework |
@@ -161,6 +175,46 @@ are in [docs/tile-format.md](docs/tile-format.md).
 | `src/tiles.js` | prioritised fetch queue and LRU cache |
 | `src/pool.js` | persistent GPU slot buffer with a free list |
 | `spike/stress.html` | completed throughput experiment, frozen |
+
+## The runtime gate
+
+`make verify` reads the binaries back and checks every invariant the format has.
+It cannot catch a viewer that has the right bytes on disk and still shows a black
+screen, because residency, culling and the per-instance origin table only exist
+once a camera is somewhere. Two bugs lived in exactly that gap - block instances
+silently dropped from the visible set, and a level whose tiles are empty where a
+macro was promoted to the overflow list.
+
+So there is a second gate, and it drives the real viewer:
+
+```sh
+make check          # headless Chrome, one assertion, non-zero exit on failure
+```
+
+**At no level, anywhere inside the die, does the viewer draw nothing where
+geometry exists - and the instances it culled in are the instances it drew.**
+
+The sample points come from the data rather than from a grid over the die: the
+coarsest far tile holds one block per region that has anything in it, so its
+block centres are exactly the points where geometry provably exists. Added to
+them is the centre of every coverage hole - a connected run of tiles that do not
+exist, enclosed by tiles that do, which is where a macro was promoted out of the
+tiles and the one place the tiles alone cannot answer for. Each point is visited
+at every level, through one block instance per orientation the chip places, and
+the frame buffer is read back at the camera position.
+
+Then a second phase, because one of the two bugs is not reachable by sampling
+levels one at a time. It needs two views in sequence - one that fills the tile
+slots, and then the chip view, which draws more block instances at once than any
+other - so the check drives exactly that, filling at each level up to the fetch
+rail and going straight out to the whole chip. The fill scale comes from the rail
+rather than from the canvas, so what the gate covers does not depend on the
+window it was run in. Without that phase the check passes on the broken code;
+with it, it reports `drew 46 of 70 culled-in block instances`.
+
+It renders on SwiftShader, so it takes minutes rather than seconds, and it needs
+a Chrome or an Edge - `CHROME=/path/to/chrome make check` if it is somewhere
+unusual.
 
 ## Findings
 

@@ -9,6 +9,7 @@
     "big": "node tools/dev.js big",
     "block": "node tools/dev.js block",
     "verify": "node tools/dev.js verify",
+    "check": "node tools/dev.js check",
     "serve": "node tools/dev.js serve",
     "bench": "node tools/dev.js bench",
     "clean": "node tools/dev.js clean"

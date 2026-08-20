@@ -1,14 +1,37 @@
 // Camera in world nanometres. Position and scale are kept in f64 on the CPU
 // and never handed to the GPU directly - see renderer.js for the origin fix.
 
+// How much of the viewport the whole world must still fill at maximum zoom-out.
+// Below 1.0 there is a little slack past fit-to-die, so `f` does not sit exactly
+// on the stop and a wheel notch outwards still moves; far below it the die is a
+// thumbnail in the corner and every level is being drawn at a scale nothing was
+// built for. 0.85 is fit-to-die plus about one notch.
+export const MIN_ZOOM_FILL = 0.85;
+
 export class Camera {
   constructor() {
     this.x = 0;          // world nm, view centre
     this.y = 0;
-    this.scale = 1;      // device px per nm
+    this._scale = 1;     // device px per nm
+    this.minScale = 0;   // zoom floor; 0 until the world size is known
     this.dpr = 1;
     this.resW = 0;
     this.resH = 0;
+  }
+
+  // Every path that sets the zoom - the wheel, `f`, a restored URL, a scripted
+  // run - goes through here, so the floor cannot be walked around by assigning
+  // to cam.scale. Panning past the die is harmless and sometimes wanted; zooming
+  // out past it is not, because there is nothing out there to navigate to.
+  get scale() { return this._scale; }
+  set scale(v) { this._scale = this.minScale > 0 ? Math.max(this.minScale, v) : v; }
+
+  // The zoom floor for a world of w x h at the current viewport. Re-derived on
+  // resize, because a narrower window fits the die at a lower scale.
+  setWorld(w, h) {
+    this.worldW = w; this.worldH = h;
+    this.minScale = Math.min(this.resW / Math.max(1, w), this.resH / Math.max(1, h)) * MIN_ZOOM_FILL;
+    this.scale = this._scale;      // re-clamp: a resize can raise the floor
   }
 
   fit(minX, minY, maxX, maxY, margin = 0.94) {
@@ -30,13 +53,18 @@ export class Camera {
   }
 
   // Zoom about a device-pixel point, keeping the world point under it fixed.
+  // At the floor the scale stops changing, so the world point stays put and the
+  // view simply refuses to go further out - it does not drift sideways.
   zoomAt(px, py, factor) {
     const wx = this.x + (px - this.resW / 2) / this.scale;
     const wy = this.y + (py - this.resH / 2) / this.scale;
-    this.scale *= factor;
+    this.scale = this._scale * factor;
     this.x = wx - (px - this.resW / 2) / this.scale;
     this.y = wy - (py - this.resH / 2) / this.scale;
   }
+
+  // True when the camera is sitting on the zoom floor, for the HUD to say so.
+  get atZoomFloor() { return this.minScale > 0 && this._scale <= this.minScale * 1.001; }
 }
 
 // Wire mouse pan and wheel zoom onto a canvas. Returns nothing; mutates cam.

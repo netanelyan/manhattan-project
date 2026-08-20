@@ -93,6 +93,10 @@ const TARGETS = {
   big: { doc: 'generate at 50m x 70 blocks - the scale test', run: o => gen({ ...o, count: '50m', blocks: '70' }) },
   block: { doc: 'generate a single block, no chip level', run: o => gen({ ...o, blocks: '1' }) },
   verify: { doc: 'check data/ against every invariant', run: o => verify(o) },
+  check: {
+    doc: 'drive the viewer in a headless browser and fail on an empty frame',
+    run: o => run([TOOL('check.js'), '--data', o.data, '--port', String(+o.port + 40)]),
+  },
   serve: { doc: 'serve the viewer, no regeneration', run: o => serve(o) },
   bench: { doc: 'time the visible-set update outside the browser', run: o => run([TOOL('bench.js'), o.data]) },
   clean: {

@@ -32,9 +32,14 @@ const FAR = 'far';
 
 // What the viewport sees, in the terms the ladder needs. nx, ny and the pitches
 // are the block instance geometry; a single block is nx = ny = 1.
-export function viewOf(resW, resH, maxTiles, chip) {
+//
+// `minScale` is the camera's zoom floor - the lowest scale the view can reach
+// at all. It changes nothing the ladder selects; it is what the floor level's
+// reachability is stated against, so "this level is drawn below the scale its
+// content was built for" is a number rather than an unwritten edge case.
+export function viewOf(resW, resH, maxTiles, chip, minScale = 0) {
   return {
-    resW, resH, maxTiles,
+    resW, resH, maxTiles, minScale,
     blockW: chip.blockSize, blockH: chip.blockSize,
     nx: chip.nx, ny: chip.ny, pitchX: chip.pitchX, pitchY: chip.pitchY,
     instances: chip.count,
@@ -115,9 +120,42 @@ export function deriveLadder(manifest, view) {
     if (minScale < floor) { minScale = floor; bound = 'monotone'; }
     if (out.length === 0) { minScale = 0; bound = 'floor'; }   // something must always draw
     floor = minScale;
-    out.push({ ...e, minScale, bound, budget, tiles, cells });
+    out.push({ ...e, minScale, bound, budget, tiles, cells,
+               contentScale: contentScale(manifest, L, opt) });
   }
-  return out;
+  return statedFloor(out, view);
+}
+
+// The scale at which this level's own smallest feature spans minCellPx: a
+// standard cell for the levels that carry placements, a density block for the
+// far levels, whose feature size is the tile divided by the density grid. Below
+// it the level is drawing something narrower than it was built to show - a
+// hairline instead of a cell, noise instead of a density map.
+//
+// It is reported, never selected on. Feeding it into minScale for far levels
+// would move switch points the pyramid on disk was already written against.
+function contentScale(manifest, L, opt) {
+  const feature = L.kind === FAR
+    ? (manifest.blockGrid ? L.tileSize / manifest.blockGrid : 0)
+    : manifest.meanCellWidth;
+  return feature > 0 ? opt.minCellPx / feature : 0;
+}
+
+// The floor level draws at any scale below the next level's switch-in, however
+// far out that goes - it is the level of last resort, and "something must
+// always draw" has no lower end on its own. Where the lower end actually comes
+// from is the camera's zoom floor, and the two have no reason to agree. So say
+// where they land: `floorSlack` is how far below its own content scale the
+// floor level can still be reached, as a ratio. 1 or less means the floor level
+// is never asked to draw below what its content was built for.
+function statedFloor(ladder, view) {
+  const p = ladder[0];
+  if (!p) return ladder;
+  const reach = view.minScale || 0;
+  p.floorReach = reach;
+  p.floorSlack = reach > 0 && p.contentScale > 0 ? p.contentScale / reach : 0;
+  if (p.floorSlack > 1) p.bound = 'floor, below its own content';
+  return ladder;
 }
 
 // Levels no zoom can ever select, dropped to a fixpoint. Used by the generator,
