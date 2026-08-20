@@ -18,7 +18,7 @@ const { spawnSync } = require('child_process');
 const ROOT = path.resolve(__dirname, '..');
 const TOOL = f => path.join(__dirname, f);
 
-const DEFAULTS = { count: '5m', blocks: '70', seed: '42', port: '8080', data: 'data' };
+const DEFAULTS = { count: '5m', blocks: '70', seed: '42', port: '8080', data: 'data', lazy: '0' };
 
 function parse(argv) {
   const o = { ...DEFAULTS, rest: [] };
@@ -41,11 +41,15 @@ function run(args, opts) {
 // somebody typed `serve` is exactly the surprise this avoids; changing --count
 // or --blocks is exactly the case where the data really is stale.
 const stampPath = o => path.join(ROOT, o.data, '.gen-params');
-const stampFor = o => `--count ${o.count} --blocks ${o.blocks} --seed ${o.seed}`;
+// Laziness is part of the stamp: switching between a written pyramid and an
+// indexed one changes what is on disk completely, and `make dev` has to notice.
+const stampFor = o => `--count ${o.count} --blocks ${o.blocks} --seed ${o.seed}` +
+                      (o.lazy !== '0' ? ' --lazy' : '');
 
 function genArgs(o) {
   return [TOOL('gen.js'), '--count', o.count, '--blocks', o.blocks,
-          '--seed', o.seed, '--out', o.data, ...o.rest];
+          '--seed', o.seed, '--out', o.data,
+          ...(o.lazy !== '0' ? ['--lazy'] : []), ...o.rest];
 }
 
 function gen(o) {
@@ -91,6 +95,14 @@ const TARGETS = {
   },
   gen: { doc: 'generate data/, always', run: o => gen(o) },
   big: { doc: 'generate at 50m x 70 blocks - the scale test', run: o => gen({ ...o, count: '50m', blocks: '70' }) },
+  lazy: {
+    doc: 'generate the far levels and an index; deep and mid tiles on demand',
+    run: o => gen({ ...o, lazy: '1' }),
+  },
+  warm: {
+    doc: 'materialise lazy tiles ahead of time (--level Z, --region x0,y0,x1,y1)',
+    run: o => run([TOOL('materialise.js'), o.data, ...o.rest]),
+  },
   block: { doc: 'generate a single block, no chip level', run: o => gen({ ...o, blocks: '1' }) },
   verify: { doc: 'check data/ against every invariant', run: o => verify(o) },
   check: {

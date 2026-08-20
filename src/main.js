@@ -545,6 +545,13 @@ function contentPoints(limit) {
   const z0 = levelZs[0];
   const t = store.peek(key(z0, 0, 0));
   if (!t || t.count === 0) return [];
+  // The points are block centres, so the coarsest level has to be a far one.
+  // It is, for every design large enough to need a pyramid; a design small
+  // enough that its coarsest level still holds placements has nothing this
+  // sweep could tell you anyway, and reading blocks out of a deep tile would
+  // fail as an unrelated TypeError rather than as this.
+  if (!t.blocks) throw new Error(`blank check: the coarsest level z${z0} is ` +
+    `${KIND_NAME[t.kind]}, not far - there are no density blocks to sample from`);
   const out = [];
   const step = Math.max(1, Math.floor(t.count / limit));
   for (let i = 0; i < t.count; i += step) {

@@ -1,0 +1,160 @@
+# Roadmap
+
+What is built, what is next, and what has been decided against. Every cost in
+here is a measurement taken on this repo unless it says otherwise; where a
+number is an extrapolation it says so and shows what it was extrapolated from.
+Estimates that predate a measurement have been replaced by the measurement.
+
+Byte layouts and the reasoning behind each of these live in
+[tile-format.md](tile-format.md); this file is about work, not format.
+
+## Where it is
+
+The pipeline is end to end on synthetic data: a generator that produces a
+chip-scale design, a tile pyramid in three representations, a lazy path that
+indexes placements instead of writing deep tiles, a WebGL2 viewer that parses
+nothing at runtime, and two gates - one that reads the binaries back and one
+that drives the real viewer in a browser and fails on an empty frame.
+
+The one thing it has never seen is a real LEF/DEF. That is the next item, and it
+is the item most of the others are waiting behind.
+
+## Done
+
+| | measured at |
+|---|---|
+| `masters.bin`, the three tile representations, the full pyramid | 5M placements: 117 MB across 4,066 tiles in 4.5 s |
+| rect-count bucketing instead of per-master draws | 8 draw calls per frame against a 4,634-master library; grouping by master needed ~4,400 |
+| derived bucket caps, solved from the design's own histogram | 2.0% bucket padding on the 5M design, against 41.7% for a fixed `[8,16,32,64]` |
+| per-level overflow lists for oversized features | content bleed at the 5M deep level 427 µm → 6.2 µm - one decap - and it stops growing with design size |
+| coverage bitmaps, so an empty region is never requested | |
+| persistent GPU slot buffers with a free list | a pan rebuilds nothing |
+| prioritised fetch, prefetch ring, LRU eviction against a byte budget | 12 rapid jumps: 40 dropped, 55 aborted, 13 fetched, against 108 without supersession |
+| LOD level chosen from zoom, ladder derived per design and per canvas | worst on-screen count anywhere in the range 1,531,094 rects of the 2,000,000 budget |
+| levels no zoom can select are solved out before writing | z5 of the 5M design, ~57 MB not written |
+| block instances, the chip level | 70 instances of a 5M block = 349M placements; chip view is **1 tile fetched, 70 draws** |
+| density that reads as structure: logic and filler channels, hue ramp over the design's own p5..p95 | |
+| layer visibility, solo, per-layer alpha, colour by class, tile overlay | all uniforms; nothing rebuilds a buffer |
+| click to identify, jump to coordinate | the tile is the spatial index; no parallel structure |
+| the view in the URL | position, scale, level, layers, colour, solo, selection |
+| lazy tiles: far levels plus a placement index, deep tiles produced on request | 50M design: 1,185 MB → 233 MB, 62 s → 15 s, p50 0.22 ms to produce a deep tile |
+| byte-identity gate between a produced tile and a written one | all 4,068 tiles of the 5M design identical |
+| `make verify`, and `make check` driving the real viewer headless | |
+| degenerate generator inputs fail with a message rather than a hang or an empty pyramid | see "Unusual input", below |
+
+## Next
+
+Ordered by what unblocks the most.
+
+### 1. Read a real LEF/DEF
+
+Everything above runs on `tools/layout.js`. The format was designed against real
+file structure and the library size was matched to a real `cells.lef` (4,634
+masters), but no real file has been through it.
+
+What it settles, in the order it settles them:
+
+- whether cell internals at deep zoom are the right thing to draw at all - a
+  real LEF has pin shapes and obstructions and **no internals**, so the deepest
+  level may be showing something that does not exist. This is the assumption in
+  the whole project most likely to be wrong;
+- how long instance names are, which is the input the names decision is waiting
+  on;
+- parse throughput, which is the one cost in the pipeline never measured;
+- whether the filler distribution assumption holds (the synthetic one is nearly
+  flat, and the faithful model was measured and reverted - see Known gaps in
+  the format doc).
+
+**Cost:** unmeasured, and deliberately not guessed. Parsing is a known quantity
+in itself; what is not known is what the shapes look like coming out.
+
+### 2. Master names
+
+A `names.bin` of concatenated UTF-8 with a `u32` offset per master: **~60 KB for
+4,634 masters**, fetched once beside `masters.bin`, resident forever. It turns
+`#1149` into a cell type, which is most of what a person wants from a click.
+
+**Cost:** small and known. Not blocked on anything. This is the cheapest real
+improvement available.
+
+### 3. Instance names, and therefore search
+
+The expensive one, and the reason there is no search box. Two shapes:
+
+| | cost |
+|---|---|
+| a `u32` offset in every placement record | 12 bytes → 16, **+33% on every deep and mid tile**, the format's largest files |
+| a side file per tile, fetched only when something is clicked | one extra request on an interaction that is rare |
+
+The side file is the better trade - identification is interactive, streaming is
+not. **Blocked on item 1**: how many bytes this actually costs depends on how
+long real names are, and inventing a length would be fitting to nothing.
+
+### 4. Several distinct blocks in one chip
+
+`chip.json` already lists `blocks[]` and every instance names one. The viewer
+loads a single master library and a single pyramid and ignores instances of any
+other block, and says so in the HUD.
+
+**Cost:** one master texture and one slot-pool set per block. Bookkeeping, not a
+new idea. Nothing measured because nothing is built; the shape of the work is
+known exactly.
+
+### 5. Quantised mid records
+
+The size lever, held in reserve. A deep or mid level is a full copy of the
+placement list at 12 bytes each, and the pyramid writes two of them. Tile-local
+coordinates at mid zoom do not need nanometre precision; `u16` at a per-level
+quantum **halves the mid levels**.
+
+Not done because it costs a per-level quantum in the format contract, and lazy
+tiles took most of the pressure off: the 50M design is 233 MB on disk, not
+1,185 MB. Reconsider if size becomes the binding constraint again.
+
+### 6. Screenshots for the stress findings
+
+`docs/img/` is three PNGs short and `docs/renderer-findings.md` has the image
+lines commented out waiting for them. See `docs/img/README.md` for what to
+capture. Trivial, and the findings doc is weaker without them.
+
+## Not planned, and why
+
+| | |
+|---|---|
+| combinational vs sequential colouring | the layer-id space is full at 16 and the depth key is `1 - layer/16`; a new class is free, a new *layer* costs a re-cut of the depth key. See Known gaps |
+| translucent layers as the default | rendering is opaque-only by design; per-layer alpha is done as ordered per-layer passes instead |
+| cross-fade between levels | two opaque passes composited; a scheduling gap rather than a blocked feature |
+| a chip-level merged representation | not needed - the block's coarsest level serves the chip view. It becomes necessary only below one tile per block |
+| `WEBGL_multi_draw` | probed at startup and reported in the HUD, not used. It would collapse draw calls, but bucketing already does that *and* gives a small fixed set of buffers, which is what makes persistent slot allocation work |
+| a spatial index parallel to the tiles | a tile already is one. A parallel structure would be per level, would have to stay in step with eviction, and would answer nothing new |
+
+## Unusual input
+
+The generator was only ever run with plausible parameters. The degenerate cases
+were tried; what they do now:
+
+| case | now |
+|---|---|
+| `--count 1`, `--blocks 0` | rejected at the CLI, one line each |
+| `--per-tile 0` or negative | rejected. Was an infinite loop, or a pyramid with `maxZ: null`, no tiles, and a clean `verify` |
+| `--density 0:0`, `LO > HI`, `HI > 1` | rejected. `0:0` divided the die area by a mean density of zero and hung filling an infinitely tall die |
+| `--buckets 0` | rejected. Was 261 verify failures from an empty cap list |
+| `--seed abc`, `--block-gap` out of range | rejected. A NaN seed silently became seed 0 |
+| a library of one cell master | works. The derived caps come from a histogram over placeable *cells*, which is not the whole library - the last cap is now widened to the library maximum, which is what `verify` has always asserted |
+| a die far from square, or placements packed into one corner | a die 100:1 out of square made **every** level far: no level carried a placement, the cells were nowhere on disk, and `verify` passed. Now a generator error naming the remedy. Corner-packed placements were always fine |
+| a master larger than a deepest tile | works - this is what overflow promotion is for, and it is the ordinary case for macros |
+| a master larger than the die | `verify` fails: `overflow placement outside tile`. Left as a loud failure; it is not a design |
+
+The two that mattered were the silent ones: an empty pyramid that verifies, and
+an all-far pyramid that verifies. Both now stop generation with a message.
+
+Half of these are not reachable through the shipped CLI at all - there is no
+flag for a one-master library, for the die aspect ratio, or for where the
+placements go, and the count floor is 100k. Those were driven by patching
+`tools/layout.js` in a scratch copy to expose the knob, running the real
+`tools/gen.js` and `tools/verify.js` over the result, and then fixing what broke
+in the shipped code. The fixture is not in the repo: it exists to find the bug,
+not to be maintained. What is in the repo is the guard each one produced, and
+`verify` now asserts the shape of the pyramid as well as the contents of its
+tiles, which is what would have caught the all-far case without a fixture at
+all.

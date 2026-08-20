@@ -8,14 +8,15 @@ typed-array view straight over the fetched `ArrayBuffer` and handed to
 This document is the contract. A producer that emits these bytes — a DEF parser,
 a GDS tiler, anything — works with the existing viewer unchanged.
 
-Format version **3**. `version` appears in both file headers and the viewer
-rejects a mismatch.
+Format version **4**. `version` appears in both file headers and in
+`chip.json`, and the viewer rejects a mismatch.
 
 | version | change |
 |---|---|
 | 1 | deep tiles only |
 | 2 | three LOD representations (deep / mid / far) |
 | 3 | deep tiles sort by rect-count bucket, not by master; per-level overflow lists |
+| 4 | a far block record carries two density channels, logic and filler, in the word that used to hold a sub-kind redundant with the layer id |
 
 ## Conventions
 
@@ -418,55 +419,72 @@ Bootstrap metadata. The only file parsed as text, fetched once.
 
 ```json
 {
-  "version": 2,
+  "version": 4,
   "seed": 42,
   "dbuPerMicron": 1000,
   "rowHeight": 1000,
   "siteWidth": 200,
-  "die":   { "w": 738600, "h": 739000 },
-  "world": { "size": 739200 },
-  "maxZ": 4,
-  "instanceCount": 501886,
-  "masterCount": 400,
-  "rectCount": 8163,
+  "die":   { "w": 2473800, "h": 2474000 },
+  "world": { "size": 2483200 },
+  "maxZ": 6,
+  "instanceCount": 4990711,
+  "masterCount": 4634,
+  "rectCount": 95784,
   "rectTexWidth": 1024,
-  "meanRectsPerInstance": 11.02,
-  "meanCellWidth": 655,
+  "meanRectsPerInstance": 8.85,
   "blockGrid": 32,
+  "densityRange": [0.2763, 0.5612],
   "rectBudget": 2000000,
-  "bucketCaps": [8, 16, 32, 64],
+  "bucketCaps": [3, 5, 9, 10, 14, 24, 32, 44],
+  "meanCellWidth": 714,
   "lod": {
     "refView": { "w": 3440, "h": 1440 },
     "minCellPx": 1.5,
     "maxVisibleTiles": 128,
     "hysteresis": 1.3,
+    "solvedFor": {
+      "instances": 70, "nx": 9, "ny": 8,
+      "pitchX": 2508032, "pitchY": 2508032,
+      "blockW": 2483200, "blockH": 2483200
+    },
     "switchPoints": [
       { "z": 0, "bound": "floor",  "minScale": 0 },
-      { "z": 4, "bound": "cells",  "minScale": 0.00229 }
-    ]
+      { "z": 1, "bound": "tiles",  "minScale": 0.000193828 },
+      { "z": 2, "bound": "tiles",  "minScale": 0.000502048 },
+      { "z": 3, "bound": "tiles",  "minScale": 0.00117345 },
+      { "z": 4, "bound": "budget", "minScale": 0.00266 },
+      { "z": 6, "bound": "tiles",  "minScale": 0.00653645 }
+    ],
+    "shadowed": [5]
   },
+  "bucketPadding": 0.0204,
   "oversizeFrac": 0.25,
   "maxRectsPerMaster": 44,
+  "strapAligned": false,
   "partial": false,
   "levels": [
     {
-      "z": 4,
+      "z": 6,
       "kind": "deep",
-      "tilesPerSide": 16,
-      "tileSize": 46200,
-      "tileCount": 256,
+      "tilesPerSide": 64,
+      "tileSize": 38800,
+      "tileCount": 3725,
       "recordBytes": 12,
-      "rectTotal": 5514009,
-      "p95PerTile": 2684,
-      "rectP95PerTile": 29192,
-      "maxBuckets": 3,
-      "maxOverhang": 3800,
-      "overflow": { "count": 426, "rectCount": 426, "bytes": 5176 },
+      "rectTotal": 44044448,
+      "p95PerTile": 1662,
+      "rectP95PerTile": 14752,
+      "maxBuckets": 8,
+      "maxOverhang": 6200,
+      "overflow": { "count": 9609, "rectCount": 9749, "bytes": 115404 },
       "coverage": "…base64…"
     }
   ]
 }
 ```
+
+The design above is `make dev`'s default: 4,990,711 placements over a 4,634-master
+library. A lazily generated design carries one extra key, `lazy`, described under
+"placements.bin"; it is absent rather than null on a full run.
 
 - `partial` is true when `--one-tile` was used and only a slice exists.
 - **`levels` can have gaps.** A level that no zoom can ever select is not
@@ -555,9 +573,39 @@ The result, same generator and seeds:
 | 5M | z4 mid | 385.6 µm | **3.8 µm** | 6 |
 | 5M | z6 deep | 427.0 µm | **3.8 µm** | 5,802 |
 
-3.8 µm is one standard cell - the residual bleed of a 4 µm master against a
-0.25 threshold - and it no longer grows with design size. Culling is back to
-fetching the tiles it actually needs.
+3.8 µm is one standard cell of the 400-master library those runs used - the
+residual bleed of a 4 µm master against a 0.25 threshold - and the point is that
+it no longer grows with design size.
+
+Today's defaults measure a little higher, for two reasons worth naming rather
+than rounding away:
+
+| design | level | tile | bleed | overflow entries |
+|---|---|---|---|---|
+| 500k | z2 mid | 196.0 µm | 19.0 µm | 5 |
+| 500k | z3 mid | 98.0 µm | 6.2 µm | 935 |
+| 500k | z4 deep | 49.0 µm | 6.2 µm | 935 |
+| 5M | z4 mid | 155.2 µm | 24.8 µm | 5 |
+| 5M | z6 deep | 38.8 µm | 6.2 µm | 9,609 |
+
+- **6.2 µm is one decap.** The library is now 4,634 masters matching a real
+  `cells.lef`, and its widest filler is 32 sites - 6.4 µm - which is under the
+  0.25 threshold at every tile size here and so stays in its tile. A placement
+  200 nm inside a tile edge bleeds 6.2 µm past it. That is the floor, and it is
+  a property of the library, not of the pyramid.
+- **The mid rows are a power strap.** An unaligned strap segment is 25 µm long,
+  which is oversized at a deep tile and promoted, but inside the 0.25 threshold
+  of a mid tile - so it stays, and bleeds by however much of its length crosses
+  the edge. That is also why the mid overflow lists hold 5 entries, the macros,
+  while the deep ones hold thousands: the straps are only oversized down there.
+
+`--strap-align` sizes strap segments to one deepest-level tile and snaps them to
+tile boundaries, which removes that: the 5M design's mid bleed drops from
+24.8 µm to 6.2 µm and its deep overflow list from 9,609 entries to 6,179. Real
+tilers split long wires at tile borders for the same reason, so it is a
+legitimate thing to do - but it is **off by default on purpose**. With it on,
+nothing in the design straddles a deep tile edge except macros, and the overflow
+path goes untested against the kind of geometry a real parser will hand it.
 
 Two invariants hold, and `tools/verify.js` enforces both:
 
@@ -566,11 +614,6 @@ Two invariants hold, and `tools/verify.js` enforces both:
 - Nothing is duplicated: a placement is in a tile *or* in the overflow list,
   never both. The size test is a pure function of the master, so the two sets
   partition exactly.
-
-The generator also sizes power strap segments to one deepest-level tile and
-aligns them to tile boundaries. Real tilers split long wires at tile borders for
-the same reason. Without that, tens of thousands of 25 µm strap segments
-straddled tile edges and landed in the overflow list for no benefit.
 
 ## Block instances: the chip level
 
@@ -597,7 +640,7 @@ of exactly one instance at the origin, so there is one code path, not two.
 
 ```json
 {
-  "version": 3,
+  "version": 4,
   "kind": "chip",
   "name": "synthetic-70",
   "blockSize": 2483200,
@@ -811,6 +854,76 @@ so rather than leaving it as an unwritten edge case.
 `contentScale` is reported, never selected on: feeding it into `minScale` for the
 far levels would move switch points that the pyramid on disk was already written
 against.
+
+## placements.bin
+
+The index deep and mid tiles are produced from when a design is generated with
+`--lazy`. Every level that carries placements holds each placement exactly once
+at 12 bytes, so each such level is one full copy of the placement array; the
+pyramid writes two of them, and on the 50M design that is 1,144 MB of the 1,182
+MB total. This is one copy at 4 bytes, and it serves every level.
+
+Nothing in the tile format changes. A tile produced from this index is
+byte-identical to one full generation writes — that is checked by the generator
+on a sample before it finishes, and by `tools/verify.js` on every tile.
+
+### Header, 64 bytes
+
+| offset | type | field | |
+|---|---|---|---|
+| 0 | u32 | `magic` | `MTNP` |
+| 4 | u16 | `version` | same version as the tiles |
+| 6 | u16 | `recordBytes` | 4, 5, 6 packed, or 12 unpacked |
+| 8 | u32 | `count` | placements |
+| 12 | u32 | `tilesPerSide` | at the deepest level, `2^maxZ` |
+| 16 | i32 | `tileSize` | deepest tile, nm |
+| 20 | i32 | `gridX` | coordinate quantum, nm; 1 if off-grid |
+| 24 | i32 | `gridY` | |
+| 28 | u8 | `bitsX` | field widths in the packed record |
+| 29 | u8 | `bitsY` | |
+| 30 | u8 | `bitsM` | |
+| 31 | u8 | `packed` | 0 = records are the 12-byte tile record verbatim |
+| 32 | u32 | `countsOff` | always 64 |
+| 36 | u32 | `dataOff` | `64 + tilesPerSide² · 4` |
+
+Then `tilesPerSide²` u32 counts, row-major, one per deepest tile. Counts, not
+offsets: an offset into an eleven-billion-placement index does not fit a u32
+while a count per tile never comes close, and the prefix sum is rebuilt at open
+in f64, which is exact to 2^53.
+
+### Records
+
+Grouped by deepest tile in the order `bucketDeepest` produces — tile-major,
+ascending original index within a tile. That order is part of the tile bytes, so
+it is part of this format's contract, not an implementation detail.
+
+A tile at level `z` covers a `2^(maxZ-z)` square of deepest tiles, which is one
+contiguous range here per row of that square, concatenated in the same row-major
+order `collectTile` walks them in. At the deepest level that is a single range.
+
+Packed, the record is one little-endian integer with `dx` in the low `bitsX`
+bits, then `dy`, then the master id, then 3 bits of orientation:
+
+```
+dx = x / gridX - floor(tileOriginX / gridX)
+dy = y / gridY - floor(tileOriginY / gridY)
+```
+
+The difference of two quantised values, **not** the quantised difference. A tile
+size need not be a multiple of the row height — 38.8um tiles on 1um rows are not
+— so `(y - tileOrigin)` can be off-grid even when every `y` is on it. Getting
+this wrong is silent: the tiles still verify, still have consistent content
+boxes, and are simply in the wrong place by less than one tile origin's
+remainder. The field is one step wider than the tile to hold the difference, and
+every record is range-checked as it is written.
+
+`gridX` and `gridY` are measured from the placement list, not assumed: if any
+coordinate is off-grid the quantum drops to 1nm and the fields widen. If the
+whole record will not fit 48 bits, `packed` is 0 and the records are the tile's
+own 12-byte placement record.
+
+On both the 5M and 50M designs the result is 30 and 31 bits respectively — one
+4-byte word, a third of the 12 the tile record needs.
 
 ### Levels that no zoom can select are not written
 
@@ -1061,6 +1174,105 @@ whatever has already arrived; tiles fold in as they land.
 Coverage bitmaps mean a tile is never requested unless it exists, so empty
 regions of the die cost nothing.
 
+## Known gaps
+
+Everything above describes what the format does. This is what it does not,
+collected in one place because it was previously spread across commit messages
+and whichever section happened to touch it. Ordered by how much each one
+matters, which is not the order of how much work each one is.
+
+### Deep zoom shows cell internals that a real LEF does not have
+
+**This is the assumption in the project most likely to be wrong.** The deep
+representation draws ~11 rectangles per placement - diffusion strips, poly
+gates, contacts, local metal1, pins - because that is what `tools/layout.js`
+invents for a standard cell, and the deep level exists to have something worth
+drawing at the bottom of the zoom range.
+
+A real `cells.lef` does not contain that. It gives a cell's bounding box, its
+**pin shapes**, and its **obstructions** - the regions routing must avoid. The
+transistor-level internals live in the foundry's GDS, which is not what a layout
+viewer is pointed at. So the deepest level may be drawing a thing with no
+counterpart in the input.
+
+What would move if that holds:
+
+- the rects-per-placement figure the deep level is budgeted against. Pins plus
+  obstructions is plausibly fewer than 11, which would shift every switch point
+  and might make another level deep;
+- the rect-count histogram, and with it the derived bucket caps and the padding
+  figure. The caps are solved from the design's own histogram precisely so this
+  is a re-solve rather than a redesign - but the shipped numbers would change;
+- what "deep" means as a representation. It may be closer to "pins and
+  obstructions" than to "internals", which is a different picture on screen even
+  though it is the same byte layout.
+
+None of the format changes. The placement record, the bucket table and the
+master rect list carry pins and obstructions exactly as well as they carry
+invented internals. What is untested is whether the *shape* of real geometry
+lands where the budget was aimed - and nothing here can be settled without a
+real LEF. Inventing an answer would be fitting to the generator again.
+
+### No names, so no search
+
+A placement is `(x, y, master | orient << 16)` and a master record is
+`(rectStart, rectCount, w, h, klass, rowH)` - twelve bytes and thirty-two bytes
+with nowhere for a string in either. So the viewer reports a master as `#1149`
+rather than inventing `DFFQX1_A`, and there is no search box: searching for
+names the format does not carry would be a feature that only works on synthetic
+data.
+
+The cost is not symmetric. Written up in full under "Identity, and what the
+format cannot answer":
+
+| | |
+|---|---|
+| master names | a `names.bin` of concatenated UTF-8 with a `u32` offset per master - **~60 KB** for 4,634 masters, fetched once beside `masters.bin` and resident forever |
+| instance names, in the record | a `u32` offset per placement: 12 bytes to 16, **+33% on every deep and mid tile**, on the format's largest files |
+| instance names, as a side file per tile | one extra request, and only when something is clicked |
+
+The side file is the better trade - identification is interactive and rare,
+streaming is not - and it is **deferred until a real DEF says how long the names
+are**. Sizing a per-tile side file against invented name lengths would settle the
+trade on made-up numbers.
+
+Identity in practice is position: two cells cannot occupy the same origin, so
+`(block instance, x, y)` names a placement exactly, and that is what a shared
+link carries.
+
+### Colour by class is cell/macro/power/filler, not combinational/sequential
+
+The classes `masters.bin` carries are **standard cell**, **macro**, **power** and
+**filler/decap**. The split an engineer would reach for next is combinational
+versus sequential - where the flops are - and it is not in the data model.
+
+The block is structural rather than an oversight. Colouring by class indexes a
+palette that also serves the 16 layer ids, and the depth key is `1 - layer/16`.
+Adding a *class* costs a palette slot, which exists. Adding a *layer* would cost
+a re-cut of the depth key, and **the layer id space is full at 16**. See "Colour
+by class".
+
+### The filler channel is nearly flat, so contrast comes from logic alone
+
+A far tile carries two density channels, logic and filler, because area that is
+occupied and area that is doing something are different questions. On this
+generator the second one barely moves: filler is drawn from the same global
+usage distribution as logic, so it is spread evenly at ~30% of placements. A
+real design fills whatever the placer left, so filler concentrates exactly where
+utilisation is low.
+
+So on synthetic data **the regional signal is entirely in the logic channel**,
+and sparse regions read blue. The dead-area grey mix is implemented and correct;
+there is nothing here for it to bite on.
+
+The faithful model - fill the leftover row space - was written, measured and
+reverted. It resizes the die, because occupancy stops being the density mean;
+that moves every switch point; that changes which levels are worth writing. It
+is a placement-model decision worth taking deliberately rather than as a side
+effect of a rendering change. See "What the viewer does with it".
+
+---
+
 ## Known constraints
 
 ### Rendering is opaque-only
@@ -1214,14 +1426,21 @@ negligible. Measured totals:
 
 | design | far levels | mid levels | deep level | total | tiles | generate |
 |---|---|---|---|---|---|---|
-| 503,823 | 0.1 MB | 2 × 5.8 MB | 5.8 MB | 17.5 MB | 334 | 0.3 s |
-| 5,037,605 | 2.4 MB | 2 × 57.7 MB | 58.0 MB | 175.8 MB | 4,984 | 3.4 s |
+| 499,672 | 0.1 MB | 2 × 5.7 MB | 5.8 MB | 17.4 MB | 333 | 0.6 s |
+| 4,990,711 | 2.4 MB | 1 × 57.1 MB | 57.8 MB | 117.3 MB | 4,068 | 4.5 s |
 
-(Version 2 figures for a 50M design: 1.26 GB across 21,845 tiles in 43 s.)
+Wall clock, best of three, on the machine in
+[renderer-findings.md](renderer-findings.md). How many mid levels a design gets
+is not a constant: the 5M design gets one, because the ladder found z5's window
+empty and skipped writing it - 57 MB that an older two-mid-level figure for this
+same design included.
+
+The 50M design is where this stops being an accounting note: written out it is
+1,185 MB, of which the two placement-carrying levels are 1,144 MB. That is what
+`--lazy` exists for, and its figures are under "placements.bin".
 
 The rule is 12 bytes per placement per deep or mid level, plus a negligible far
-tail; how many mid levels a design gets depends on where `MIN_CELL_PX` and the
-rect budget fall. If total size becomes a problem the lever is quantising mid
+tail. If total size becomes a problem the lever is quantising mid
 records — tile-local coordinates at mid zoom do not need nanometre precision, and
 `u16` at a per-level quantum would halve the mid levels — but it costs a
 per-level quantum in the contract, so it is not done.
@@ -1247,18 +1466,21 @@ per-level quantum in the contract, so it is not done.
 | LOD level chosen from zoom | done — derived ladder with hysteresis, `[` / `]` / `l` override |
 | levels no zoom can select | done — solved before writing, skipped, listed in `lod.shadowed` |
 | block instances, chip level | done — `chip.json`, fetched once and drawn N times |
+| lazy tiles: `placements.bin`, deep and mid produced on request | done — byte-identical to written tiles, gated on that |
 | several distinct blocks in one chip | in the format, not in the viewer |
-| density representation, logic and filler channels | done |
+| density representation, logic and filler channels | done — the filler channel is nearly flat on synthetic data, see Known gaps |
 | click to identify | done - reuses tiles as the spatial index |
 | jump to coordinate | done - chip coordinates, block instance resolved |
 | shareable view URL | done - position, scale, level, layers, colour, solo, selection |
-| instance and master names | not in the format, see Identity |
+| instance and master names | not in the format, see Known gaps |
 | layer visibility, solo, per-layer alpha | done — alpha via ordered per-layer passes |
 | colour by cell class | done — cell / macro / power / filler |
-| combinational vs sequential class | not in the data model, see Layers |
+| combinational vs sequential class | not in the data model, see Known gaps |
 | chip-level merged representation | not needed yet — the block's coarsest level serves the chip view; below one tile per block would need it |
 | cross-fade between levels | not implemented — two opaque passes composited, see Known constraints |
 | translucent layers | not planned, see Known constraints |
+| deep-level cell internals | drawn, and generator-invented. A real LEF has pin shapes and obstructions and no internals — untested against real data, see Known gaps |
+| degenerate generator input | done — the cases that hung or wrote an unviewable pyramid now stop with a message; see docs/roadmap.md |
 
 Verified by `node tools/verify.js data`, which re-reads the binaries with the
 same zero-parse view logic the viewer uses and checks magic numbers, versions,

@@ -46,6 +46,12 @@ async function main() {
   let scratch = new Int32Array(1 << 16);
   const need = n => { if (scratch.length < n) scratch = new Int32Array(n); return scratch; };
 
+  // A lazily generated design has no deep or mid tiles on disk. Producing them
+  // here is the point rather than a workaround: this bench measures the slot
+  // builders over real tiles, and a tile off the index is the same tile.
+  const factory = manifest.levels.some(L => L.lazy)
+    ? new (require('./lazy.js').TileFactory)(DIR) : null;
+
   for (const lvl of manifest.levels) {
     const side = lvl.tilesPerSide;
     const want = Math.min(TILES, lvl.tileCount);
@@ -54,8 +60,14 @@ async function main() {
     for (let y = 0; y < side; y++) {
       for (let x = 0; x < side; x++) {
         const p = path.join(DIR, 'tiles', String(lvl.z), String(x), `${y}.bin`);
-        if (!fs.existsSync(p)) continue;
-        tiles.push(viewTile(readBuf(p)));
+        if (lvl.lazy && !fs.existsSync(p)) {
+          const made = factory.build(lvl.z, x, y);
+          if (!made) continue;
+          tiles.push(viewTile(made.buffer.slice(made.byteOffset, made.byteOffset + made.byteLength)));
+        } else {
+          if (!fs.existsSync(p)) continue;
+          tiles.push(viewTile(readBuf(p)));
+        }
         if (tiles.length >= want) break outer;
       }
     }

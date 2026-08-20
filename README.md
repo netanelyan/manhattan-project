@@ -3,14 +3,38 @@
 A chip-layout renderer built on one invariant: digital layout is Manhattan
 geometry, so everything on screen is an axis-aligned rectangle.
 
+## What it does
+
+Opens a chip layout in a browser tab and lets you navigate it - pan, zoom from
+the whole die down to the rectangles inside a single cell, toggle layers, click
+a cell to see what it is, and paste the resulting URL into a review so someone
+else lands on the same rectangle.
+
+It does that at a scale that does not fit on a GPU, which is the whole problem.
+Designs of tens of millions of placements can never be handed to the renderer
+whole, so the data is a **tile pyramid in three representations** - full cell
+internals at the deepest levels, one outline per cell in the middle, merged
+density blocks at the top - and the viewer picks a level from the zoom on a
+rectangle budget. Tiles are binary, laid out so the viewer takes typed-array
+views straight over the bytes and **parses nothing at runtime**.
+
+Everything here runs on a synthetic generator. No real LEF/DEF has been through
+it yet; [docs/roadmap.md](docs/roadmap.md) says what that is expected to settle.
+
 New to chip design? Start with the [domain primer](domain-primer.md) - it builds
 up from "a chip is printed, not assembled" to the file formats and architectural
 decisions this project rests on, assuming zero semiconductor background.
 
-## Background
+## The numbers
 
-[Domain primer](domain-primer.md) - chip design context for anyone not from the
-semiconductor world.
+| | |
+|---|---|
+| **draw budget** | ~2M rectangles at 60fps, measured on an RTX 4060 at 3440x1440 ([findings](docs/renderer-findings.md)). This is the constraint everything else answers to |
+| **worst frame in the zoom range** | 1,531,094 rectangles, 77% of that budget, at the deepest level just before it is given up |
+| **draw calls** | 8 per frame inside a block, against a 4,634-master library - they group by rect-count bucket, not by master, so the count does not track library size |
+| **block instancing** | a 5M-placement block placed 70 times is 349M placements at chip level, in the block's 117 MB rather than ~8.2 GB flattened. At the full-chip view that is **1 tile fetched and 70 draws** |
+| **scale tested at** | a 50M-placement block, 70 instances - 3.5 billion placements at chip level. Written out it is 1,185 MB in 62 s; with deep tiles produced on demand it is 233 MB in 15 s, and a produced tile is byte-identical to a written one |
+| **default dev design** | 5M placements, 117 MB, 4.5 s to generate |
 
 ## Running it
 
@@ -30,6 +54,8 @@ descriptions of the workflow that can drift:
 | `make dev` | `npm run dev` | generate if needed, verify, serve |
 | `make gen` | `npm run gen` | generate `data/`, always |
 | `make big` | `npm run big` | generate at 50m x 70 blocks - the scale test |
+| `make lazy` | `npm run lazy` | far levels plus an index; deep tiles on demand |
+| `make warm` | `npm run warm` | materialise lazy tiles ahead of time |
 | `make block` | `npm run block` | generate a single block, no chip level |
 | `make verify` | `npm run verify` | check `data/` against every invariant |
 | `make check` | `npm run check` | drive the viewer headless; fail on an empty frame |
@@ -41,13 +67,16 @@ Parameters override: `make gen COUNT=20m BLOCKS=9`, or
 `npm run gen -- --count 20m --blocks 9`. Generation records what it was given,
 so `make dev` regenerates when the parameters change and skips when they have
 not — rebuilding 1.2 GB because someone typed `make serve` is not a good
-surprise. Generation always verifies what it wrote; `--no-verify` opts out.
+surprise. Generation always verifies what it wrote; `--no-verify` opts out. Every
+parameter states its range and is rejected outside it, because the interesting
+failures are not errors: `--per-tile 0` used to loop forever and `--density 0:0`
+used to divide the die area by zero and fill an infinitely tall die.
 
 `--blocks N` sets how many times the chip places the block (70 by default,
 `--blocks 1` for a bare block), and `--block-orient none|rows|all` how they are
-oriented. `--count` accepts 100k to 50M (`500k`, `1.5M`). 500k takes 0.3s and 17.5 MB; 5M
-takes 3.4s and 176 MB; a 50M design runs to about 1.2 GB, so check your disk
-before asking for one. The master library is 4,634 cells, matching a real
+oriented. `--count` accepts 100k to 50M (`500k`, `1.5M`). 500k takes 0.6 s and 17.4 MB; 5M
+takes 4.5 s and 117 MB; a 50M design runs to about 1.2 GB, so check your disk
+before asking for one - or use `make lazy`, below, which is 233 MB and 15 s. The master library is 4,634 cells, matching a real
 `cells.lef`.
 
 Viewer keys - `?` or `h` in the viewer lists them, grouped, and does not
@@ -82,6 +111,67 @@ it is printed on. So a layer key has no referent there. The filter is ignored
 rather than obeyed into an empty frame, and the viewer says so on screen instead
 of leaving you to work out why `shift`+`5` blanked the die. `]` steps to a level
 that does have layers.
+
+## Lazy tiles
+
+The deep levels are almost all of the pyramid and almost none of what anyone
+looks at. On the 50M design, z6 and z7 are 1,144 MB of 1,182 MB - 96% - and a
+session opens a few hundred of their 18,686 tiles. Extrapolated to a real block
+of ~11 billion placements that is ~270 GB and about four hours of generation,
+the overwhelming majority of it deep tiles nobody will ever open. That, not
+rendering and not parsing, is what stops the real target.
+
+So generation splits in two:
+
+| | what | why |
+|---|---|---|
+| **eager** | the far levels, every level's overflow list, `masters.bin` | small, and everyone sees them the moment they open the viewer |
+| **lazy** | every deep and mid level | one full copy of the placement array each, and mostly never read |
+
+```sh
+make lazy           # then make serve, or make dev, exactly as before
+```
+
+What replaces them is `placements.bin`: the placement list grouped by deepest
+tile, with a count per tile. A tile at level `z` is one contiguous range per row
+of the `2^(maxZ-z)` square of deepest tiles it covers, so producing it is a
+positional read and a call into the same builder full generation uses. The
+viewer is not told and needs no change - it asks for `tiles/{z}/{x}/{y}.bin` the
+way it always did, and `tools/serve.js` builds one when the file is not there.
+
+Measured on the 50M design:
+
+| | full | lazy |
+|---|---|---|
+| on disk | 1,185 MB | 233 MB (39 MB far, 190 MB index) |
+| generation | 62 s | 15 s |
+| producing one deep tile | - | p50 0.22 ms, p99 0.42 ms |
+| producing one mid tile | - | p50 0.35 ms, p99 0.67 ms |
+
+A produced tile is indistinguishable from a static one over HTTP: p50 15.56 ms
+against 15.55 ms for the same tile read off disk, on the same server, in the
+same loop. The 15 ms is the request; the tile is the 0.2 ms inside it. The
+viewer's fetch path needs no adjusting because there is nothing to adjust for.
+
+The index is one copy of the placement array at 4 bytes a placement, against the
+12 bytes a tile record needs - coordinates relative to the deepest tile and on
+the placement grid, plus a master id and an orientation, in one 32-bit word. The
+grid is measured from the data and range-checked, never assumed.
+
+**The gate is byte-identity.** A tile produced from the index has to be the tile
+full generation would have written - not equivalent, identical - or lazy and
+eager tiles are not interchangeable and `verify` covers only one of them. So
+generation builds a sample of tiles both ways and compares the bytes before it
+finishes, `tools/verify.js` produces every lazy tile and checks it exactly as it
+checks a written one, and `tools/materialise.js --all` will write the lot out for
+a full comparison. On the 5M design all 4,068 tiles come out identical.
+
+That gate is not paranoia. The bug it caught was a tile origin that is not a
+multiple of the row height, which makes `y - origin` off-grid even when every
+`y` is on it: every tile below the first row was 200nm out. The tiles still
+verified - consistent headers, consistent content boxes, consistent bucket
+tables - and `make check` still passed, because 200nm is subpixel. Only the byte
+comparison saw it.
 
 ## Hierarchy
 
@@ -164,6 +254,9 @@ are in [docs/tile-format.md](docs/tile-format.md).
 | `tools/format.js` | binary layout constants shared with the docs |
 | `tools/dev.js` | the workflow behind `make` and `npm run` |
 | `tools/verify.js` | reads the binaries back and checks every viewer invariant |
+| `tools/pindex.js` | `placements.bin`: the index deep and mid tiles are produced from |
+| `tools/lazy.js` | producing one tile from the index, byte-identical to a written one |
+| `tools/materialise.js` | writing lazy tiles ahead of time, and timing them |
 | `tools/check.js` | drives the viewer headless: the runtime gate above |
 | `tools/bench.js` | times the staging rebuild on real tiles, outside the browser |
 | `tools/serve.js` | static file server, core Node only |
@@ -225,4 +318,15 @@ rather than optimisations.
 ## Formats
 
 [Tile format](docs/tile-format.md) - byte layout of `masters.bin` and the tile
-pyramid, and why the viewer parses nothing at runtime.
+pyramid, and why the viewer parses nothing at runtime. Its **Known gaps**
+section is what the format cannot answer: no names and therefore no search, a
+class split the layer id space has no room for, a filler channel the synthetic
+data barely exercises, and cell internals at deep zoom that a real LEF does not
+have.
+
+## Where it is going
+
+[Roadmap](docs/roadmap.md) - what is built and what it measured, what is next
+and what each one costs, and what has been decided against. The short version:
+nothing here has read a real LEF/DEF yet, and most of the open items are waiting
+behind that one.

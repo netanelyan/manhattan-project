@@ -4,6 +4,7 @@
 #
 #   make dev                     generate if needed, verify, serve
 #   make check                   drive the viewer headless and fail on an empty frame
+#   make lazy                    far levels plus an index; deep tiles on demand
 #   make gen COUNT=20m BLOCKS=9  parameters override on the command line
 #
 # No GNU extensions, no shell built-ins, forward slashes only.
@@ -13,9 +14,10 @@ BLOCKS = 70
 SEED   = 42
 PORT   = 8080
 DATA   = data
+LAZY   = 0
 
 DEV = node tools/dev.js
-ARGS = --count $(COUNT) --blocks $(BLOCKS) --seed $(SEED) --port $(PORT) --data $(DATA)
+ARGS = --count $(COUNT) --blocks $(BLOCKS) --seed $(SEED) --port $(PORT) --data $(DATA) --lazy $(LAZY)
 
 help:
 	@$(DEV) help
@@ -28,6 +30,12 @@ gen:
 
 big:
 	@$(DEV) big $(ARGS)
+
+lazy:
+	@$(DEV) lazy $(ARGS)
+
+warm:
+	@$(DEV) warm $(ARGS)
 
 block:
 	@$(DEV) block $(ARGS)
@@ -47,4 +55,4 @@ bench:
 clean:
 	@$(DEV) clean $(ARGS)
 
-.PHONY: help dev gen big block verify check serve bench clean
+.PHONY: help dev gen big lazy warm block verify check serve bench clean

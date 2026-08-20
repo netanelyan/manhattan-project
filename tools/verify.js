@@ -33,6 +33,30 @@ check(manifest.version === F.VERSION, `manifest version ${manifest.version}`);
 console.log(`manifest    v${manifest.version}, maxZ ${manifest.maxZ}, ` +
             `${manifest.instanceCount.toLocaleString()} placements, world ${manifest.world.size}nm`);
 
+// ---------------------------------------------------------------- lazy levels
+//
+// A lazily generated design has no deep or mid tiles on disk; it has an index
+// they are produced from. Verifying it means producing every one of them and
+// checking it exactly as a written tile is checked - not checking the index and
+// trusting the builder. That is the only reading of "verify covers both" worth
+// having, and it is what makes lazy and eager tiles interchangeable rather than
+// merely intended to be.
+const lazyLevels = new Set(manifest.levels.filter(L => L.lazy).map(L => L.z));
+let factory = null;
+if (lazyLevels.size) {
+  const { TileFactory } = require('./lazy.js');
+  factory = new TileFactory(DIR);
+  const ix = factory.index;
+  check(ix.count === manifest.instanceCount,
+        `placements.bin holds ${ix.count}, manifest says ${manifest.instanceCount}`);
+  check(ix.tilesPerSide === 1 << manifest.maxZ, 'placements.bin indexed at maxZ');
+  check(ix.tileSize * ix.tilesPerSide === manifest.world.size, 'placements.bin covers the world');
+  console.log(`placements  ${ix.count.toLocaleString()} indexed, ${ix.recordBytes} bytes each ` +
+              `(${ix.packed ? `packed on a ${ix.gridX}x${ix.gridY}nm grid` : 'unpacked'}), ` +
+              `${(fs.statSync(path.join(DIR, 'placements.bin')).size / 1048576).toFixed(1)} MB ` +
+              `-> z${[...lazyLevels].join(', z')} on demand`);
+}
+
 // ---------------------------------------------------------------- masters.bin
 const mbuf = read(path.join(DIR, 'masters.bin'));
 const mh = new Uint32Array(mbuf, 0, 8);
@@ -81,6 +105,16 @@ const caps = manifest.bucketCaps;
 check(Array.isArray(caps) && caps.length > 0, 'manifest has bucketCaps');
 check(caps.every((c, i) => i === 0 || c > caps[i - 1]), 'bucketCaps strictly ascending');
 check(caps[caps.length - 1] >= manifest.maxRectsPerMaster, 'last cap covers the largest master');
+
+// A pyramid with no levels, or one whose every level is an abstract density
+// map, is not a small design - it is a design whose placements were never
+// written anywhere. Every per-tile check below passes on it, because there are
+// no tiles to fail, so the shape of the pyramid has to be asserted before its
+// contents are.
+check(manifest.levels.length > 0, 'the pyramid has at least one level');
+check(manifest.levels.some(L => L.kind === 'deep' || L.kind === 'mid'),
+      'at least one level carries placements rather than merged density');
+check(Number.isInteger(manifest.maxZ) && manifest.maxZ >= 0, `maxZ ${manifest.maxZ}`);
 
 let totalTiles = 0, totalBytes = 0;
 
@@ -208,14 +242,32 @@ for (const lvl of manifest.levels) {
     levelCount += r.placements; levelRects += r.rects; levelBytes += r.bytes;
   }
 
+  const lazy = lazyLevels.has(lvl.z);
   for (let i = 0; i < side * side; i++) {
     const tx = i % side, ty = (i / side) | 0;
     const p = path.join(DIR, 'tiles', String(lvl.z), String(tx), `${ty}.bin`);
-    const exists = fs.existsSync(p);
-    if (!check(exists === !!present(i), `z${lvl.z}/${tx}/${ty} coverage bit vs file`)) continue;
-    if (!exists) continue;
+    let buf;
+    if (lazy) {
+      // The coverage bitmap is the contract on a lazy level: it is what the
+      // viewer culls against, so a tile it claims must be producible and a tile
+      // it denies must produce nothing.
+      const made = factory.exists(lvl.z, tx, ty) ? factory.build(lvl.z, tx, ty) : null;
+      if (!check(!!made === !!present(i), `z${lvl.z}/${tx}/${ty} coverage bit vs producible`)) continue;
+      if (!made) continue;
+      // A materialised tile on disk must be the one the factory produces, or
+      // the cache is serving something generation would not have written.
+      if (fs.existsSync(p)) {
+        check(fs.readFileSync(p).equals(made), `z${lvl.z}/${tx}/${ty} cached copy differs from produced`);
+      }
+      buf = made.buffer.slice(made.byteOffset, made.byteOffset + made.byteLength);
+    } else {
+      const exists = fs.existsSync(p);
+      if (!check(exists === !!present(i), `z${lvl.z}/${tx}/${ty} coverage bit vs file`)) continue;
+      if (!exists) continue;
+      buf = read(p);
+    }
 
-    const r = checkTile(read(p), lvl, kindId, `${lvl.z}/${tx}/${ty}`, tx, ty, false);
+    const r = checkTile(buf, lvl, kindId, `${lvl.z}/${tx}/${ty}`, tx, ty, false);
     levelCount += r.placements; levelRects += r.rects; levelBytes += r.bytes;
     if (r.bucketCount > maxB) maxB = r.bucketCount;
     totalTiles++; totalBytes += r.bytes;
@@ -232,14 +284,15 @@ for (const lvl of manifest.levels) {
   if (full) check(maxB === lvl.maxBuckets, `z${lvl.z} maxBuckets`);
 
   console.log(`z${String(lvl.z).padStart(2)} ${lvl.kind.padEnd(4)} ` +
-    `${String(checked).padStart(6)}/${String(lvl.tileCount).padEnd(6)} tiles  ` +
+    `${String(checked).padStart(6)}/${String(lvl.tileCount).padEnd(6)} tiles${lazy ? '*' : ' '} ` +
     `${(levelBytes / 1048576).toFixed(1).padStart(7)} MB  ` +
     `${levelRects.toLocaleString().padStart(12)} rects` +
     (kindId !== F.TILE_KIND.FAR ? `  ${levelCount.toLocaleString()} placements` : '') +
     (lvl.overflow ? `  +${lvl.overflow.count} overflow` : ''));
 }
 
-console.log(`total       ${totalTiles.toLocaleString()} tiles, ${(totalBytes / 1048576).toFixed(1)} MB`);
+console.log(`total       ${totalTiles.toLocaleString()} tiles, ${(totalBytes / 1048576).toFixed(1)} MB` +
+            (lazyLevels.size ? `  (* produced from placements.bin, not read from disk)` : ''));
 
 // ---------------------------------------------------------------- lod ladder
 //

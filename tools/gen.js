@@ -14,6 +14,7 @@ const layout = require('./layout.js');
 const P = require('./pyramid.js');
 const C = require('./chip.js');
 const F = require('./format.js');
+const IX = require('./pindex.js');
 
 // ---------------------------------------------------------------- cli
 function parseArgs(argv) {
@@ -21,7 +22,7 @@ function parseArgs(argv) {
     count: 1000000, out: 'data', seed: 42, perTile: 4096,
     densityLo: 0.40, densityHi: 0.95, oneTile: false,
     buckets: F.DEFAULT_BUCKETS, strapAlign: false,
-    blocks: 70, blockOrient: 'rows', blockGap: 0.01, verify: true,
+    blocks: 70, blockOrient: 'rows', blockGap: 0.01, verify: true, lazy: false,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -42,6 +43,7 @@ function parseArgs(argv) {
       case '--block-orient': o.blockOrient = next(); break;
       case '--block-gap': o.blockGap = +next(); break;
       case '--one-tile':  o.oneTile = true; break;
+      case '--lazy':      o.lazy = true; break;
       case '--no-verify': o.verify = false; break;
       case '-h': case '--help': usage(); process.exit(0);
       default: console.error(`unknown flag ${a}`); usage(); process.exit(1);
@@ -59,6 +61,25 @@ function parseArgs(argv) {
     console.error('--count must be between 100k and 50M');
     process.exit(1);
   }
+  // Every remaining knob feeds a division or a log somewhere downstream, and a
+  // zero or a NaN does not surface as an error - it surfaces as a pyramid with
+  // no levels in it, or as a loop that never ends. --per-tile 0 makes maxZ
+  // infinite; --density 0:0 divides the die area by a mean density of zero and
+  // hangs filling an infinitely tall die; --buckets 0 derives an empty cap list
+  // and writes deep tiles that no viewer can read. So the range is stated here,
+  // once, where it can still be said in one line.
+  const range = (v, lo, hi, msg) => {
+    if (!(Number.isFinite(v) && v >= lo && v <= hi)) { console.error(msg); process.exit(1); }
+  };
+  range(o.perTile, 64, 1000000, '--per-tile must be between 64 and 1M');
+  range(o.buckets, 1, 32, '--buckets must be between 1 and 32');
+  range(o.seed, 0, 4294967295, '--seed must be an integer between 0 and 2^32-1');
+  range(o.blockGap, 0, 0.99, '--block-gap must be between 0 and 0.99');
+  if (!(Number.isFinite(o.densityLo) && Number.isFinite(o.densityHi) &&
+        o.densityLo > 0 && o.densityLo <= o.densityHi && o.densityHi <= 1)) {
+    console.error('--density must be LO:HI with 0 < LO <= HI <= 1');
+    process.exit(1);
+  }
   return o;
 }
 
@@ -72,23 +93,80 @@ function parseCount(s) {
 function usage() {
   console.log(`manhattan tile generator
 
-  --count N       total instances, 100k .. 50M (accepts 1.5M / 500k)  [1M]
-  --out DIR       output directory                                    [data]
-  --seed S        PRNG seed                                           [42]
-  --per-tile N    target instances per deepest-level tile             [4096]
-  --density LO:HI standard cell row density range                     [0.40:0.95]
-  --buckets N     rect-count buckets to derive, = deep draw calls      [8]
+  --count N       total instances, 100k .. 50M (accepts 1.5M / 500k)   [1M]
+  --out DIR       output directory                                     [data]
+  --seed S        PRNG seed, 0 .. 2^32-1                               [42]
+  --per-tile N    target instances per deepest-level tile, 64 .. 1M    [4096]
+  --density LO:HI row density range, 0 < LO <= HI <= 1                 [0.40:0.95]
+  --buckets N     rect-count buckets to derive = deep draw calls, 1..32 [8]
   --strap-align   snap power straps to deepest-tile boundaries         [off]
-  --blocks N      block instances in the synthetic chip                [70]
+  --blocks N      block instances in the synthetic chip, 1 .. 4096     [70]
   --block-orient  none | rows (mirror alternate rows) | all            [rows]
-  --block-gap F   routing channel between blocks, as a fraction        [0.01]
+  --block-gap F   routing channel between blocks, fraction 0 .. 0.99   [0.01]
   --one-tile      emit only the busiest deepest-level tile
+  --lazy          write only the far levels; index the placements instead, and
+                  produce deep and mid tiles on demand (see tools/lazy.js)
   --no-verify     skip the verify pass that normally follows generation`);
 }
 
 const fmt = n => n.toLocaleString('en-US');
 const um = nm => (nm / 1000).toFixed(1) + 'um';
 const mb = b => (b / 1048576).toFixed(1) + ' MB';
+
+// The gate on laziness, run before generation finishes.
+//
+// The claim the whole scheme rests on is that a tile produced from the index is
+// the tile full generation would have written. Nothing downstream can check
+// that: a tile built from wrong coordinates still has a consistent header, a
+// consistent content box and a consistent bucket table, so it verifies happily
+// and draws in the wrong place. The only thing that catches it is building the
+// same tile both ways and comparing the bytes - and the one moment both paths
+// are available at once is here, with the placement list still in memory and
+// the index just written.
+//
+// So a sample of tiles from every lazy level is built twice and compared. It
+// found exactly the bug it was written for: a tile origin that is not a
+// multiple of the row height makes (y - origin) off-grid even though every y is
+// on it, and every tile below the first row of the design was 200nm out.
+const PROVE_SAMPLE = 24;
+
+function proveIndex(outDir, gen, bucket, levels, keepIdx, oversizeByLevel, maxZ, caps,
+                    scratch, gather, manifestLevels) {
+  const t0 = Date.now();
+  const { TileFactory } = require('./lazy.js');
+  const factory = new TileFactory(outDir);
+  const openMs = Date.now() - t0;
+  let checked = 0;
+  for (let li = 0; li < levels.length; li++) {
+    const L = levels[li];
+    if (!keepIdx.has(li) || L.kind === F.TILE_KIND.FAR) continue;
+    const side = L.tilesPerSide;
+    const ml = manifestLevels.find(e => e.z === L.z);
+    if (!ml || !ml.lazy) continue;
+    const cov = Buffer.from(ml.coverage, 'base64');
+    const live = [];
+    for (let i = 0; i < side * side; i++) if ((cov[i >> 3] >> (i & 7)) & 1) live.push(i);
+    const step = Math.max(1, Math.floor(live.length / PROVE_SAMPLE));
+    for (let s = 0; s < live.length; s += step) {
+      const idx = live[s], X = idx % side, Y = (idx / side) | 0;
+      const m = P.collectTile(bucket, maxZ, L.z, X, Y, gather, oversizeByLevel[li], gen.instances.m);
+      const eager = L.kind === F.TILE_KIND.DEEP
+        ? P.buildDeepTile(gen, gather, m, L.z, X, Y, L.tileSize, scratch, caps)
+        : P.buildMidTile(gen, gather, m, L.z, X, Y, L.tileSize);
+      const lazyBuf = factory.build(L.z, X, Y);
+      if (!lazyBuf || !eager.buf.equals(lazyBuf)) {
+        console.error(`  the index does not reproduce z${L.z}/${X}/${Y}: ` +
+                      `${eager.buf.length} bytes written vs ${lazyBuf ? lazyBuf.length : 'nothing'} produced`);
+        process.exit(1);
+      }
+      checked++;
+    }
+  }
+  factory.index.close();
+  console.log(`              ${checked} sampled tiles rebuilt from the index and compared byte for ` +
+              `byte with what full generation writes (${Date.now() - t0}ms, ${openMs}ms of it opening)`);
+  return checked;
+}
 
 // Level entry for a level that was skipped (--one-tile), so the manifest still
 // describes the pyramid's shape.
@@ -165,6 +243,15 @@ async function main() {
   // distribution the generator happens to produce; a real library spikes
   // somewhere else entirely.
   const caps = F.deriveCaps(gen.rectHist, opts.buckets);
+  // The histogram is over cells the placer draws from, which is not the whole
+  // library: macros and power straps are placed too, and they land in the
+  // overflow list, which is bucketed with these same caps. On this generator
+  // the widest standard cell has more rectangles than any macro, so the last
+  // cap covers them by luck rather than by construction - shrink the cell
+  // library and it stops being true, and the overflow tile is then written
+  // with a bucket id off the end of the list. The last cap is the library
+  // maximum by definition, so say so.
+  if (caps[caps.length - 1] < maxRects) caps[caps.length - 1] = maxRects;
   const cost = F.capCost(gen.rectHist, caps);
 
   const mInfo = writeMasters(outDir, gen);
@@ -181,6 +268,25 @@ async function main() {
       `${String(L.nonEmpty).padStart(6)}/${String(L.tilesPerSide ** 2).padEnd(6)} ` +
       `${um(L.tileSize).padStart(9)}  ${fmt(L.p95).padStart(9)}  ${L.cellPx.toFixed(2).padStart(7)}   ` +
       (L.cost === null ? `${F.BLOCK_GRID}x${F.BLOCK_GRID} blocks` : fmt(Math.round(L.cost))));
+  }
+
+  // A level is far when one rectangle per placement already blows the budget.
+  // If that is true of every level - which happens when the placements are
+  // packed into a small part of the world, because the pyramid is sized from
+  // --count on the assumption that they are spread over it - then no level
+  // holds a placement, nothing on disk carries a cell, and no zoom can ever
+  // show one. The tiles that do get written are consistent and verify happily,
+  // which is what makes this worth failing on here rather than discovering in
+  // the viewer.
+  const deepest = levels[levels.length - 1];
+  if (!levels.some(L => L.kind !== F.TILE_KIND.FAR)) {
+    console.error(`  every level came out far: the deepest tile holds ${fmt(deepest.p95)} placements ` +
+                  `at ${deepest.cellPx.toFixed(2)} px per cell, which is over the ` +
+                  `${fmt(F.RECT_BUDGET)} rectangle budget even at one outline each, so no level ` +
+                  `carries placements and the cells would be nowhere on disk.`);
+    console.error(`  the pyramid is sized from --count / --per-tile assuming placements spread over ` +
+                  `the die; lower --per-tile to cut the deepest tile down.`);
+    process.exit(1);
   }
 
   // --- far levels need a density mip chain plus the structures worth keeping
@@ -282,7 +388,7 @@ async function main() {
   // --- write every level
   const tw = Date.now();
   const manifestLevels = [];
-  let totalTiles = 0, totalBytes = 0;
+  let totalTiles = 0, totalBytes = 0, lazyTiles = 0;
 
   // --one-tile writes just the busiest deepest tile, for quick round-trip checks.
   let onlyTile = -1;
@@ -291,6 +397,18 @@ async function main() {
     let best = 0;
     for (let i = 0; i < deepest.length; i++) if (deepest[i] > best) { best = deepest[i]; onlyTile = i; }
   }
+
+  // Which levels are written now and which are indexed for later.
+  //
+  // A deep or mid level holds every placement exactly once, so each one is a
+  // full copy of the placement array on disk - and the pyramid writes two of
+  // them. The index is one copy at a third of the bytes and serves every such
+  // level, so anything that carries placements is better produced on demand
+  // than written. Far levels are not placements at all: they are the merged
+  // density map, they are what the viewer opens with, and they are small. They
+  // stay eager, and so does every level's overflow list, which is
+  // always-resident by definition and could not be lazily fetched anyway.
+  const isLazy = L => opts.lazy && !opts.oneTile && L.kind !== F.TILE_KIND.FAR;
 
   for (let li = 0; li < levels.length; li++) {
     const L = levels[li];
@@ -317,6 +435,37 @@ async function main() {
         bytes += overflow.buf.length;
         rects += overflow.rectCount;
       }
+    }
+
+    // A lazy level writes no tiles. Everything the manifest says about it -
+    // which tiles exist, what a tile costs in rectangles, how far its content
+    // bleeds - is a property of the placement list, so it is computed here in
+    // one pass and checked against the costing pass exactly as written tiles
+    // are. tools/lazy.js produces the tiles themselves, on request.
+    if (isLazy(L)) {
+      const st = P.levelTileStats(gen, bucket, maxZ, L, mask, caps);
+      if (st.rectP95 !== costs[li].rectP95) {
+        console.error(`  costing pass disagrees with the lazy level plan at z${L.z}: ` +
+                      `${costs[li].rectP95} predicted, ${st.rectP95} planned`);
+        process.exit(1);
+      }
+      manifestLevels.push({
+        z: L.z, kind: F.KIND_NAME[L.kind], tilesPerSide: side, tileSize: L.tileSize,
+        tileCount: st.tiles, recordBytes: F.RECORD_BYTES[L.kind],
+        rectTotal: st.rectTotal + (overflow ? overflow.rectCount : 0),
+        p95PerTile: L.p95, rectP95PerTile: st.rectP95,
+        maxBuckets: st.maxBuckets, maxOverhang: st.overhang,
+        overflow: overflow ? { count: overflow.count, rectCount: overflow.rectCount, bytes: overflow.buf.length } : null,
+        coverage: Buffer.from(P.coverageBitmap(st.present, side)).toString('base64'),
+        lazy: true,
+      });
+      lazyTiles += st.tiles;
+      totalTiles += overflow ? 1 : 0; totalBytes += bytes;
+      console.log(`    z${L.z} ${F.KIND_NAME[L.kind].padEnd(5)} ${fmt(st.tiles).padStart(6)} tiles  ` +
+        `${'on demand'.padStart(9)}  ${fmt(st.rectTotal + (overflow ? overflow.rectCount : 0)).padStart(12)} rects  bleed ${um(st.overhang).padStart(8)}` +
+        (overflow ? `  overflow ${fmt(overflow.count)}` : '') +
+        (st.maxBuckets ? `  ${st.maxBuckets} buckets/tile` : ''));
+      continue;
     }
 
     for (let Y = 0; Y < side; Y++) {
@@ -391,6 +540,27 @@ async function main() {
   }
   console.log(`  tiles       ${fmt(totalTiles)} written, ${mb(totalBytes)}, ${((Date.now() - tw) / 1000).toFixed(1)}s`);
 
+  // The index. Written last, because it is only worth anything once the levels
+  // that need it know they are lazy.
+  let indexInfo = null;
+  if (opts.lazy && !opts.oneTile) {
+    const ti = Date.now();
+    const pack = IX.planPacking(gen, tileSize, layout.SITE_W, layout.ROW_H);
+    indexInfo = IX.writeIndex(outDir, gen, bucket, pack);
+    indexInfo.ms = Date.now() - ti;
+    const per = indexInfo.recordBytes;
+    console.log(`  index       placements.bin ${mb(indexInfo.bytes)}, ${per} bytes/placement ` +
+      (indexInfo.packed
+        ? `(${indexInfo.bits} bits: x/${indexInfo.gridX}nm, y/${indexInfo.gridY}nm, master, orient)`
+        : '(unpacked: the placement record verbatim)') +
+      `, ${(indexInfo.ms / 1000).toFixed(1)}s`);
+    const nLazyLevels = manifestLevels.filter(L => L.lazy).length;
+    const notWritten = lazyTiles * F.T_HEADER_BYTES + n * F.INSTANCE_BYTES * nLazyLevels;
+    console.log(`              ${fmt(lazyTiles)} deep and mid tiles across ${nLazyLevels} level` +
+                `${nLazyLevels === 1 ? '' : 's'} produced on demand instead of written ` +
+                `(about ${mb(notWritten)} not on disk)`);
+  }
+
   const manifest = {
     version: F.VERSION,
     seed: opts.seed,
@@ -431,9 +601,22 @@ async function main() {
     maxRectsPerMaster: maxRects,
     strapAligned: gen.strapAligned,
     partial: opts.oneTile,
+    // Absent, not null, when generation was not lazy: a full run's manifest has
+    // to stay byte-for-byte what it was before any of this existed.
+    ...(indexInfo ? { lazy: { recordBytes: indexInfo.recordBytes, bytes: indexInfo.bytes,
+                              packed: indexInfo.packed, gridX: indexInfo.gridX,
+                              gridY: indexInfo.gridY } } : {}),
     levels: manifestLevels,
   };
   fs.writeFileSync(path.join(outDir, 'manifest.json'), JSON.stringify(manifest, null, 2));
+
+  // Written after the manifest because the proof reads the design back exactly
+  // as the tile server will: through TileFactory, off disk, with no access to
+  // anything still in memory here.
+  if (indexInfo) {
+    indexInfo.checked = proveIndex(outDir, gen, bucket, levels, keepIdx, oversizeByLevel,
+                                   maxZ, caps, scratch, gather, manifestLevels);
+  }
 
   // --- the chip: N instances of the block that was just written.
   //

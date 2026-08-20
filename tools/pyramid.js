@@ -490,6 +490,75 @@ function levelRectCounts(gen, bucket, maxZ, L, oversize, mips, structures, world
   return out;
 }
 
+// Everything the manifest records about a level, computed without building a
+// single tile.
+//
+// This is what makes a level skippable. The manifest has to describe a lazy
+// level exactly as it would describe a written one - the coverage bitmap the
+// viewer culls against, the rectangle p95 the LOD ladder is solved from, the
+// content bleed the viewer expands its cull rect by - and all of it is a
+// property of the placement list, not of the bytes on disk. One linear pass per
+// level, no allocation per tile, no I/O.
+//
+// The numbers are checked against the ones the writer produced, so this is not
+// a second opinion that could drift: gen.js already fails hard when the costing
+// pass and the written tiles disagree, and the same assertion now covers this.
+function levelTileStats(gen, bucket, maxZ, L, oversize, caps) {
+  const side = 1 << L.z;
+  const shift = maxZ - L.z;
+  const nT = side * side;
+  const deep = L.kind === F.TILE_KIND.DEEP;
+  const counts = new Int32Array(nT);
+  const rects = new Int32Array(nT);
+  const bmask = new Int32Array(nT);        // which rect-count buckets a tile uses
+  const { x, y, m, o } = gen.instances;
+  const masters = gen.masters;
+  const S = L.tileSize;
+  let overhang = 0;
+
+  for (let t = 0; t < bucket.nTiles; t++) {
+    const tx = t % bucket.tilesPerSide, ty = (t / bucket.tilesPerSide) | 0;
+    const T = (ty >> shift) * side + (tx >> shift);
+    const ox = (T % side) * S, oy = ((T / side) | 0) * S;
+    for (let i = bucket.start[t], e = bucket.end[t]; i < e; i++) {
+      const j = bucket.order[i];
+      const mm = m[j];
+      if (oversize[mm]) continue;
+      counts[T]++;
+      const rc = masters[mm].rectCount;
+      rects[T] += deep ? rc : 1;
+      if (deep) bmask[T] |= 1 << F.bucketOf(rc, caps);
+      // Content bleed: how far this placement reaches past its own tile. The
+      // per-tile content box is only ever used to take this maximum, so the
+      // maximum over placements is the same number one tile-box at a time.
+      const box = orientedBox(masters, mm, o[j]);
+      const ovx = x[j] - ox + box.w - S, ovy = y[j] - oy + box.h - S;
+      if (ovx > overhang) overhang = ovx;
+      if (ovy > overhang) overhang = ovy;
+    }
+  }
+
+  const present = new Uint8Array(nT);
+  const perTile = [];
+  let tiles = 0, rectTotal = 0, maxBuckets = 0;
+  for (let T = 0; T < nT; T++) {
+    if (counts[T] === 0) continue;
+    present[T] = 1;
+    tiles++;
+    rectTotal += rects[T];
+    perTile.push(rects[T]);
+    if (deep) {
+      let b = 0;
+      for (let v = bmask[T]; v; v &= v - 1) b++;
+      if (b > maxBuckets) maxBuckets = b;
+    }
+  }
+  perTile.sort((a, b) => a - b);
+  const rectP95 = perTile.length
+    ? perTile[Math.min(perTile.length - 1, Math.floor(perTile.length * 0.95))] : 0;
+  return { tiles, rectTotal, rectP95, maxBuckets, overhang: Math.max(0, overhang), present };
+}
+
 // The level's overflow list, costed the same way. It is resident whenever the
 // level is, so it is part of what the level costs on screen.
 function overflowCost(gen, mask, kind) {
@@ -525,6 +594,6 @@ module.exports = {
   bucketDeepest, collectTile, levelCounts, planLevels,
   oversizeMask, collectOverflow,
   buildDeepTile, buildMidTile, buildFarTile, farTileBlocks, buildOverflowTile,
-  levelRectCounts, overflowCost, p95NonEmpty,
+  levelRectCounts, levelTileStats, overflowCost, p95NonEmpty,
   buildDensityMips, densityRange, collectStructures, coverageBitmap, orientedBox,
 };
