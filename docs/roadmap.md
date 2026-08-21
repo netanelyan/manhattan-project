@@ -40,6 +40,7 @@ under "What real data changed", below.
 | block instances, the chip level | 70 instances of a 5M block = 349M placements; chip view is **1 tile fetched, 70 draws** |
 | density that reads as structure: logic and filler channels, hue ramp over the design's own p5..p95 | |
 | layer visibility, solo, per-layer alpha, colour by class, tile overlay | all uniforms; nothing rebuilds a buffer |
+| many designs on one server: `?data=<dir>`, a picker, and import/generate forms over the existing CLI tools | switching resets the camera, and a stale `view=` from another die is refused rather than drawn as an empty frame |
 | the layer panel: grouped rows, parent toggles, visible and selectable as separate axes | 15 rows in 5 groups, process layers and instance categories in one list; the instance categories were unfilterable at any zoom before it |
 | click to identify, jump to coordinate | the tile is the spatial index; no parallel structure |
 | the view in the URL | position, scale, level, layers, colour, solo, selection |

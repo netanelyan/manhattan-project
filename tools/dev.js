@@ -18,7 +18,8 @@ const { spawnSync } = require('child_process');
 const ROOT = path.resolve(__dirname, '..');
 const TOOL = f => path.join(__dirname, f);
 
-const DEFAULTS = { count: '5m', blocks: '70', seed: '42', port: '8080', data: 'data', lazy: '0' };
+const DEFAULTS = { count: '5m', blocks: '70', seed: '42', port: '8080', data: 'data',
+                   lazy: '0', force: '0' };
 
 function parse(argv) {
   const o = { ...DEFAULTS, rest: [] };
@@ -52,7 +53,33 @@ function genArgs(o) {
           ...(o.lazy !== '0' ? ['--lazy'] : []), ...o.rest];
 }
 
+// Who wrote what is in this directory, from the manifest's own account of
+// itself. `null` means there is nothing there yet.
+function producer(o) {
+  try {
+    const m = JSON.parse(fs.readFileSync(path.join(ROOT, o.data, 'manifest.json'), 'utf8'));
+    return m.source || 'synthetic';
+  } catch { return null; }
+}
+
+// A design this generator did not write is not this generator's to overwrite.
+//
+// The stamp is absent on an imported pyramid by construction - import-def.js
+// does not write one - so without this, `make dev` on a directory holding a
+// LEF/DEF import reads "unknown parameters" and replaces a real design with a
+// synthetic one. Re-importing is cheap; discovering afterwards that it happened
+// is not, and `data/` is exactly the directory somebody will point an import at.
+function guard(o, what) {
+  const src = producer(o);
+  if (!src || src === 'synthetic' || o.force !== '0') return false;
+  console.error(`${o.data}/ holds a ${src} design - refusing to ${what} over it.`);
+  console.error(`  generate somewhere else:  make ${what === 'generate' ? 'gen' : 'dev'} DATA=data-synth`);
+  console.error(`  or overwrite it anyway:   make ${what === 'generate' ? 'gen' : 'dev'} DATA=${o.data} FORCE=1`);
+  return true;
+}
+
 function gen(o) {
+  if (guard(o, 'generate')) process.exit(2);
   run(genArgs(o));                       // gen.js verifies what it wrote
   fs.writeFileSync(stampPath(o), stampFor(o) + '\n');
 }
@@ -64,6 +91,12 @@ function ensure(o) {
     console.log(`${o.data}/ is empty - generating`);
     gen(o);
     return true;
+  }
+  const src = producer(o);
+  if (src && src !== 'synthetic' && o.force === '0') {
+    console.log(`${o.data}/ holds a ${src} design - leaving it alone, verifying and serving it as it is.`);
+    console.log(`  (make gen DATA=${o.data} FORCE=1 would replace it with a generated one)`);
+    return false;
   }
   let stamp = '';
   try { stamp = fs.readFileSync(stampPath(o), 'utf8').trim(); } catch { stamp = ''; }
@@ -121,9 +154,12 @@ const TARGETS = {
 };
 
 function verify(o) { run([TOOL('verify.js'), o.data]); }
+// The URL comes from serve.js rather than being printed here as well: it is the
+// one that knows whether the directory is really a design, and two places
+// printing the address someone is about to click is two places to get it wrong.
 function serve(o) {
-  console.log(`\nviewer  http://localhost:${o.port}/src/`);
-  run([TOOL('serve.js'), o.port]);
+  console.log('');
+  run([TOOL('serve.js'), o.port, '--data', o.data]);
 }
 
 const opts = parse(process.argv.slice(3));

@@ -101,6 +101,7 @@ disappear when the HUD does:
 | | `g` | go to an `x, y` coordinate in nm |
 | | click | identify what is under the cursor |
 | | `esc` | dismiss the identify readout or the coordinate box |
+| designs | `o` | pick a design, import a LEF/DEF, generate a synthetic one |
 | level | `l` | automatic / manual LOD level |
 | | `[` `]` | force the level down / up (switches to manual) |
 | layers | `shift`+`l` | the layer panel |
@@ -157,6 +158,59 @@ open all day - grouped rows with parent toggles, V and S as separate columns, an
 instance categories listed alongside physical layers. Theirs has a fourth column,
 M, whose meaning is not known here; `COLUMNS` in `src/panel.js` is where it goes
 when it is.
+
+## More than one design
+
+A design is a directory of tiles, and there is more than one of them now. The
+server holds them all, and the URL says which one you are looking at:
+
+```sh
+node tools/serve.js --data data-sb16     # prints the URL with ?data= on it
+```
+
+| | |
+|---|---|
+| `?data=<dir>` | names the design, alongside every other view parameter. A bare name is a directory at the server root; a leading `/`, a `.`, or a full URL is taken as given |
+| `o` in the viewer | the picker: every design on disk with its placement count, die size, source and bytes, plus forms to import or generate one |
+| `make dev DATA=data-sb16` | serve a chosen one from the workflow |
+
+**Switching designs resets the camera.** A position that meant something on a
+2.47 x 2.47 mm die means nothing on a 1.49 x 1.62 mm one, and carrying it across
+leaves you in empty space reading `placements 0` with nothing on screen to say
+why. The picker drops the camera keys and keeps the display ones — layers,
+colour, HUD mode. A hand-edited link that carries a stale `view=` is checked on
+arrival: if the camera cannot see any of the design, it is ignored, the die is
+fitted, and the HUD says so.
+
+**A design this generator did not write is never regenerated over.** An imported
+pyramid has no `.gen-params` stamp, so `make dev DATA=data` used to read
+"unknown parameters" and replace a real design with a synthetic one. It now
+refuses and names the flag: `FORCE=1`.
+
+### Import and generate from the browser
+
+`o` also opens a drop zone. Give it a benchmark directory — or `cells.lef`,
+`tech.lef` and `floorplan.def` — and the server runs **the same
+`tools/import-def.js` the CLI runs** and streams its stdout back into the panel.
+The generator has a form beside it over `tools/gen.js`.
+
+There is no parser in the browser and no second writer. Tiling is an offline job
+by design: it happens once, in a process, and an 89 GB DEF was never going to be
+held in a tab. What the browser path removes is the flag syntax, not the
+architecture.
+
+- the importer's own output is what you read — the layer table, the master
+  stats, the derived bucket caps, the `PLACEMENT SYNTHESIZED` banner. Those
+  numbers are the most useful thing either tool produces and they were CLI-only
+- a floorplan DEF is refused with the remedy, not an error code: *tick "place
+  into the DEF rows" and import again*
+- the flags that matter are on the form: place, no SIZE box, per-tile, lazy
+- **256 MB per file, 600 MB per import.** Not caution: `tools/import-def.js`
+  reads each file into one JavaScript string and V8 caps a string at about
+  512 MB, so a file that size does not go through it on the CLI either. That is
+  what a streaming parser is for, and this is not one
+- because those routes start processes, the server binds to `127.0.0.1` unless
+  `--host` says otherwise, and `--no-jobs` turns them off
 
 ## Real data
 
@@ -297,6 +351,7 @@ pan - and loading it restores exactly what was on screen:
 
 | parameter | |
 |---|---|
+| `data=data-sb16` | which design - a directory on the server |
 | `view=x,y,scale` | camera centre in nm, and device pixels per nm |
 | `z=N&auto=0` | a level held by hand; absent means the level follows the zoom |
 | `mask=0x1f4` | which layers are visible |
@@ -364,6 +419,7 @@ are in [docs/tile-format.md](docs/tile-format.md).
 | `tools/serve.js` | static file server, core Node only |
 | `src/` | the viewer: plain ES modules, WebGL2, no framework |
 | `src/panel.js` | the layer panel: the row model, and what a row means at each level |
+| `src/designs.js` | the design picker, and the two forms that make a design |
 | `src/slots.js` | the hot path: one tile to its GPU slot records |
 | `src/lod.js` | switch points from zoom, solved per design, chip and canvas |
 | `src/chip.js` | block instances and the block-to-chip transform |

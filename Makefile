@@ -6,6 +6,12 @@
 #   make check                   drive the viewer headless and fail on an empty frame
 #   make lazy                    far levels plus an index; deep tiles on demand
 #   make gen COUNT=20m BLOCKS=9  parameters override on the command line
+#   make dev DATA=data-sb16      any design directory; the viewer opens ?data=data-sb16
+#
+# DATA names a directory under the repo root, not a fixed location: the server
+# serves them all and the viewer picks one with ?data= in the URL. A directory
+# holding a design this generator did not write is never regenerated over
+# without FORCE=1.
 #
 # No GNU extensions, no shell built-ins, forward slashes only.
 
@@ -15,9 +21,10 @@ SEED   = 42
 PORT   = 8080
 DATA   = data
 LAZY   = 0
+FORCE  = 0
 
 DEV = node tools/dev.js
-ARGS = --count $(COUNT) --blocks $(BLOCKS) --seed $(SEED) --port $(PORT) --data $(DATA) --lazy $(LAZY)
+ARGS = --count $(COUNT) --blocks $(BLOCKS) --seed $(SEED) --port $(PORT) --data $(DATA) --lazy $(LAZY) --force $(FORCE)
 
 help:
 	@$(DEV) help

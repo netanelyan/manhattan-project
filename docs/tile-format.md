@@ -1782,7 +1782,8 @@ per-level quantum in the contract, so it is not done.
 | density representation, logic and filler channels | done — the filler channel is nearly flat on synthetic data, see Known gaps |
 | click to identify | done - reuses tiles as the spatial index |
 | jump to coordinate | done - chip coordinates, block instance resolved |
-| shareable view URL | done - position, scale, level, layers, colour, solo, selection |
+| shareable view URL | done - design, position, scale, level, layers, colour, solo, selection |
+| many designs on one server | done - `?data=<dir>`, a picker over `/__designs`, and import/generate routes that shell out to the CLI tools |
 | instance and master names | not in the format, see Known gaps |
 | named power nets, power domains | not in the format — blocked with names, and to be decided with them, see Known gaps |
 | layer visibility, solo, per-layer alpha | done — alpha via ordered per-layer passes, per layer or all at once |

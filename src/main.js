@@ -18,13 +18,37 @@ import { viewMasters, KIND_NAME, key, overflowKey } from './format.js';
 import { Camera, attachControls } from './camera.js';
 import { Renderer, LAYER_NAMES, CLASS_LAYER_NAMES, ALPHA_PRESET } from './renderer.js';
 import { LayerPanel, ROWS, KEY_ROWS, soloMask, appliesAt, isCategory } from './panel.js';
+import { DesignPanel } from './designs.js';
 import { TileStore, PRIORITY } from './tiles.js';
 import { deriveLadder, LevelPicker, viewOf } from './lod.js';
 import { Chip, singleInstance, rectToBlock } from './chip.js';
 import { pick, KLASS_NAME, ORIENT_NAME } from './pick.js';
 
 const params = new URLSearchParams(location.search);
-const DATA = params.get('data') || '../data';
+
+// ---------------------------------------------------------------- which design
+//
+// `?data=` names the design, and it is the mechanism rather than a debugging
+// convenience: one server holds many designs, and a shared link should say
+// which one it is looking at as well as where the camera is. It composes with
+// every other parameter for free, because the URL already is the view.
+//
+// It accepts what a person actually types. A bare name is a directory at the
+// server root, which is where a generated or imported pyramid sits; anything
+// already rooted, explicitly relative, or fully qualified is taken as given.
+// The default stays `../data` so a link with no `data=` on it means what it has
+// always meant.
+function resolveData(v) {
+  if (!v) return '../data';
+  const s = v.replace(/\/+$/, '');
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(s)) return s;   // http://host/designs/x
+  if (s.startsWith('/') || s.startsWith('.')) return s;
+  return '/' + s;                                     // data-sb16 -> /data-sb16
+}
+const DATA = resolveData(params.get('data'));
+// What to call it on screen. The trailing path element is the directory name,
+// which is what someone typed and what they will type again.
+const DATA_NAME = DATA.replace(/^.*\//, '') || DATA;
 const CACHE_MB = +(params.get('cache') || 64);
 let maxVisibleTiles = +(params.get('maxtiles') || 128);   // manifest default applied at boot
 const PREFETCH_RING = +(params.get('ring') ?? 1);
@@ -36,6 +60,7 @@ const notice = document.getElementById('notice');
 const help = document.getElementById('help');
 const panel = document.getElementById('panel');
 const layersEl = document.getElementById('layers');
+const designsEl = document.getElementById('designs');
 const bar = document.getElementById('bar');
 const jumpInput = document.getElementById('jump');
 const gl = canvas.getContext('webgl2', { antialias: false, depth: true });
@@ -56,6 +81,42 @@ let status = 'loading...';
 // are different questions. See src/panel.js.
 let selectMask = 0xffff;
 let layerPanel = null;
+
+// What design is on screen, and anything about how it got here that the picture
+// would not tell you. Both matter more now that `?data=` means a link can point
+// at any design on the server: a HUD that does not name the design leaves the
+// reader guessing whose numbers these are, and a pyramid built from placement
+// nobody measured looks exactly like one built from placement somebody did.
+let designLine = '', designWarning = '';
+
+// The picker is built before boot, not after, because the case it most needs to
+// cover is boot failing: `?data=` naming a directory that is not there should
+// offer the list of the ones that are, rather than a dead page.
+const designPanel = new DesignPanel(designsEl, {
+  current: DATA_NAME,
+  onStatus: t => { status = t; },
+});
+
+function describeDesign() {
+  const m = manifest;
+  const um1 = v => (v / 1000).toFixed(1);
+  designLine = `${DATA_NAME}   ${m.source || 'synthetic'}   ${fmt(m.instanceCount)} placements   ` +
+    `${fmt(m.masterCount)} masters   ${um1(m.die.w)} x ${um1(m.die.h)} um`;
+
+  const p = m.provenance;
+  if (!p) return;
+  designLine += `   from ${p.dir}`;
+  if (!/^synthesized/.test(p.placement || '')) return;
+  // Stated on screen rather than in the manifest alone. The far levels exist to
+  // show where a design is dense, and on this one that is the one thing nobody
+  // measured - so the view is honest about it for as long as it is true.
+  designWarning =
+    `${DATA_NAME}: the placement is synthesized, not read from the DEF. ` +
+    `${fmt(p.unplacedInInput)} components arrived UNPLACED and were filled into the design's own ` +
+    `rows at ${(100 * p.utilisation).toFixed(1)}% utilisation. Library, die, rows and the ` +
+    `${fmt(p.fixedInInput)} fixed macros are real; where the cells sit is not, so the density ` +
+    `map is flat where a real one has structure.`;
+}
 
 let levelZs = [];                       // levels that exist, ascending
 const levelOf = z => levelByZ.get(z);
@@ -277,7 +338,13 @@ function scheduleApply() {
 async function boot() {
   resize();
   const t0 = performance.now();
-  manifest = await (await fetch(`${DATA}/manifest.json`)).json();
+  // Checked rather than parsed blind: with `?data=` naming the design, the
+  // ordinary mistake is a directory that is not there, and a 404 fed to
+  // JSON.parse surfaces as "Unexpected token <", which names nothing.
+  const res = await fetch(`${DATA}/manifest.json`);
+  if (!res.ok) throw new Error(`${DATA}/manifest.json - ${res.status} ${res.statusText}`);
+  manifest = await res.json();
+  describeDesign();
 
   // The chip beside the block, if there is one. A viewer pointed at a bare
   // block runs as a chip of one instance at the origin, so there is one path
@@ -316,12 +383,28 @@ async function boot() {
   auto = !manifest.partial && params.get('auto') !== '0';
   if (params.has('z')) { wantZ = nearestZ(+params.get('z')); auto = false; }
   else if (!auto) wantZ = manifest.maxZ;
+  // A camera restored from the URL, checked against the design it landed on.
+  //
+  // `?data=` means a link can name any design on the server, and a `view=` that
+  // meant something on a 2.47 x 2.47 mm die means nothing on a 1.49 x 1.62 mm
+  // one: it puts the camera outside the design entirely, and what you get is an
+  // empty frame reading `placements 0` with nothing on screen to say why. The
+  // picker drops the camera keys when it switches design, but a hand-edited or
+  // hand-shared link will not, so the restore is checked rather than trusted.
   const v = params.get('view');
   if (v) {
     const [cx, cy, sc] = v.split(',').map(Number);
+    const before = { x: cam.x, y: cam.y, scale: cam.scale };
     if (Number.isFinite(cx)) cam.x = cx;
     if (Number.isFinite(cy)) cam.y = cy;
     if (Number.isFinite(sc)) cam.scale = sc;
+    const b = cam.bounds();
+    if (b.maxX <= 0 || b.minX >= chip.w || b.maxY <= 0 || b.minY >= chip.h) {
+      cam.x = before.x; cam.y = before.y; cam.scale = before.scale;
+      chipNote = `view= was outside this design and was ignored`;
+      status = `the camera in the link is outside ${DATA_NAME} ` +
+        `(${nm(cx)}, ${nm(cy)} against a ${um(chip.w)} x ${um(chip.h)} chip) - fitted the die instead`;
+    }
   }
   if (params.has('tiles')) renderer.showTiles = true;
   if (params.has('mask')) renderer.layerMask = parseInt(params.get('mask'), 0);
@@ -1058,6 +1141,11 @@ const HELP_GROUPS = [
     ['', 'a deep level draws process layers and a coarser one draws instance'],
     ['', 'categories, so the panel dims the rows that cannot apply here'],
   ]],
+  ['designs', [
+    ['o', 'pick a design, import a LEF/DEF, generate a synthetic one'],
+    ['', 'the URL names the design: ?data=<dir>, alongside the camera'],
+    ['', 'switching resets the camera; layers and colour carry over'],
+  ]],
   ['display', [
     ['d', 'HUD: full / one line / off'],
     ['?  h', 'this panel'],
@@ -1122,7 +1210,14 @@ window.addEventListener('keydown', e => {
     else if (e.key === 'Escape') closeJump();
     return;
   }
+  // A key typed into a form field belongs to the form field. Without this,
+  // naming a design `data-metal2` in the picker toggles metal2 five times.
+  if (e.target && /^(INPUT|SELECT|TEXTAREA|BUTTON)$/.test(e.target.tagName)) {
+    if (e.key === 'Escape') e.target.blur();
+    return;
+  }
   if (e.key === 'Escape') {
+    if (designPanel.on) { designPanel.on = false; return; }
     if (help.classList.contains('on')) { help.classList.remove('on'); return; }
     closeJump(); clearPanel(); return;
   }
@@ -1146,6 +1241,7 @@ window.addEventListener('keydown', e => {
     case 'a': R.layerMask = R.layerMask === 0xffff ? 0 : 0xffff; soloLayer = -1; break;
     case 'v': setAllAlpha(R, !R.translucent); break;
     case 'L': layerPanel.toggle(); status = `layer panel ${layerPanel.on ? 'on' : 'off'}`; break;
+    case 'o': designPanel.toggle(); break;
     case 'b': R.blockBounds = !R.blockBounds; break;
     case 'c': R.colorMode ^= 1; break;
     case 't': R.showTiles = !R.showTiles; break;
@@ -1235,6 +1331,9 @@ function countLine(R, budget) {
 // the diagnostics off must not turn the warnings off with them.
 function warnings(R) {
   const out = [];
+  // First, and it outlives every other warning here because it is a property of
+  // the design rather than of the moment.
+  if (designWarning) out.push(designWarning);
   // The mask is two halves and a level carries one of them, so this names which
   // half is being ignored rather than saying only that something is.
   if (R.layerFilterIgnored) {
@@ -1292,7 +1391,7 @@ function drawHud(dt) {
   // One line is what is worth carrying while navigating: where the ladder is,
   // what it costs against the budget, and whether the frame is keeping up.
   if (hudMode === HUD_LINE) {
-    hud.textContent = `z${useZ}/${manifest.maxZ} ${KIND_NAME[R.kind]} ${auto ? 'auto' : 'MANUAL'}   ` +
+    hud.textContent = `${DATA_NAME}   z${useZ}/${manifest.maxZ} ${KIND_NAME[R.kind]} ${auto ? 'auto' : 'MANUAL'}   ` +
       `${countLine(R, budget)}   fps ${fps}`;
     return;
   }
@@ -1303,7 +1402,8 @@ function drawHud(dt) {
   const nmPerPx = 1 / cam.scale;
   const reqs = s.loaded + s.hits;
   hud.textContent =
-`LOD        z ${useZ} / ${manifest.maxZ}   ${KIND_NAME[R.kind]}   tile ${(L.tileSize / 1000).toFixed(1)}um   bleed ${(L.maxOverhang / 1000).toFixed(1)}um   ${auto ? 'auto' : 'MANUAL'}` +
+`design     ${designLine}
+LOD        z ${useZ} / ${manifest.maxZ}   ${KIND_NAME[R.kind]}   tile ${(L.tileSize / 1000).toFixed(1)}um   bleed ${(L.maxOverhang / 1000).toFixed(1)}um   ${auto ? 'auto' : 'MANUAL'}` +
   `${clamped ? `   (clamped from z${wantZ})` : ''}
 ladder     ${ladderLine()}   holds >= ${band[0].toExponential(2)}, switches in at ${band[1].toExponential(2)} (${bound})   est ${fmt(Math.round(est))} rects${floorLine()}
 chip       ${fmt(R.instances.length)} / ${fmt(chip.count)} block instances on screen${R.instancesDropped ? `   ${R.instancesDropped} NOT DRAWN` : ''}   draws ${fmt(R.drawCalls)}   ${chipNote}
@@ -1329,6 +1429,21 @@ try {
   await boot();
 } catch (e) {
   status = String(e);
-  hud.textContent = `boot failed: ${e.message}\n\nRun the generator first:\n  node tools/gen.js --count 500k\nthen serve the repo root:\n  node tools/serve.js`;
+  hud.textContent =
+`boot failed: ${e.message}
+
+?data=${params.get('data') || '(absent, so ../data)'}  ->  ${DATA}
+
+A design is a directory holding manifest.json, masters.bin and tiles/.
+Generate one:
+  node tools/gen.js --count 500k --out data
+or import one:
+  node tools/import-def.js --dir <lef/def dir> --place rows --out data-real
+then serve the repo root and name it in the URL:
+  node tools/serve.js --data data-real`;
   console.error(e);
+  // The likeliest reason to be here is a design that is not on this server, and
+  // the list of the ones that are is one keystroke away - so open it rather
+  // than leaving a dead page with a paragraph on it.
+  designPanel.on = true;
 }

@@ -6,7 +6,7 @@
 <style>
   html, body { margin: 0; height: 100%; background: #0e0e10; overflow: hidden; }
   canvas { display: block; width: 100vw; height: 100vh; cursor: grab; }
-  #hud, #panel, #bar, #help, #notice, #layers {
+  #hud, #panel, #bar, #help, #notice, #layers, #designs {
     color: #9fd49f; font: 12px/1.55 Consolas, "DejaVu Sans Mono", monospace;
     background: rgba(0, 0, 0, .58); padding: 8px 12px; border: 1px solid #24301f;
   }
@@ -90,6 +90,72 @@
   .bx.sw { width: 16px; border-color: #24301f; }
   .bx.sw.on { opacity: .3; }
   .lp-off .bx.sw.on { opacity: .18; }
+
+  /* The design picker and the two forms that make a design. Same green on
+     black as everything else - this is a tool panel, not a product surface. */
+  #designs {
+    position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
+    display: none; width: min(112ch, 94vw); max-height: 88vh; overflow: auto;
+    padding: 12px 16px 16px; background: rgba(0, 0, 0, .93);
+  }
+  #designs.on { display: block; }
+  #designs.dg-drag { border-color: #9fd49f; }
+  .dg-h {
+    color: #cfe9cf; letter-spacing: .08em; text-transform: uppercase;
+    border-bottom: 1px solid #24301f; padding-bottom: 6px; margin-bottom: 10px;
+  }
+  .dg-k { float: right; color: #6f9a6f; letter-spacing: 0; text-transform: none; }
+  .dg-h2 {
+    color: #cfe9cf; letter-spacing: .08em; text-transform: uppercase;
+    margin: 18px 0 8px; border-bottom: 1px solid #24301f; padding-bottom: 5px;
+  }
+  .dg-r {
+    display: grid; grid-template-columns: 22ch 10ch 13ch 14ch 12ch 1fr;
+    gap: 0 1ch; padding: 3px 6px; border: 1px solid transparent; cursor: pointer;
+  }
+  .dg-r .n { text-align: right; }
+  .dg-hd { color: #6f9a6f; cursor: default; border-bottom: 1px solid #24301f; }
+  .dg-r:not(.dg-hd):hover { background: #12200f; border-color: #35502e; }
+  .dg-cur { border-color: #4a6b3f; background: #0f1a0d; }
+  .dg-cur .dg-n { color: #cfe9cf; }
+  .dg-s { color: #6f9a6f; }
+  .dg-s.dg-real { color: #7fb3d5; }
+  .dg-w { color: #e6c27a; }
+  .dg-r i { color: #6f9a6f; font-style: normal; }
+  .dg-empty, .dg-note { color: #6f9a6f; padding: 6px 6px 0; }
+  .dg-m { color: #cfe9cf; }
+  .dg-bad { color: #e08a5a; }
+  .dg-form { padding: 2px 6px; }
+  .dg-row { display: flex; flex-wrap: wrap; gap: 0 2.2ch; align-items: center; margin: 7px 0; }
+  .dg-row label { color: #6f9a6f; }
+  #designs input[type="text"], #designs select {
+    background: #0a0a0c; border: 1px solid #35502e; color: #cfe9cf;
+    font: inherit; padding: 1px 4px; outline: none;
+  }
+  #designs input[type="text"]:focus, #designs select:focus,
+  #designs button:focus-visible, .dg-file:focus-within { border-color: #9fd49f; outline: 1px solid #9fd49f; }
+  #designs input[type="checkbox"] { accent-color: #6f9a6f; vertical-align: -1px; }
+  .dg-file { display: inline-block; margin-right: 1.5ch; }
+  .dg-file input { position: absolute; width: 1px; height: 1px; opacity: 0; }
+  .dg-file span {
+    display: inline-block; border: 1px solid #35502e; padding: 2px 8px;
+    color: #cfe9cf; cursor: pointer;
+  }
+  .dg-file span:hover { border-color: #9fd49f; }
+  .dg-files { color: #9fd49f; margin: 8px 0 2px; }
+  .dg-go {
+    background: #14240f; border: 1px solid #4a6b3f; color: #cfe9cf;
+    font: inherit; padding: 3px 14px; margin-top: 6px; cursor: pointer;
+  }
+  .dg-go:hover:not(:disabled) { border-color: #9fd49f; background: #1b3014; }
+  .dg-go:disabled { opacity: .45; cursor: default; }
+  .dg-log {
+    margin: 0; padding: 8px 10px; max-height: 30vh; overflow: auto;
+    background: #08080a; border: 1px solid #24301f; color: #9fd49f;
+    white-space: pre-wrap; font: inherit;
+  }
+  .dg-busy .dg-log { border-color: #4a6b3f; }
+  .dg-nojobs .dg-form { opacity: .4; pointer-events: none; }
 </style>
 </head>
 <body>
@@ -99,6 +165,7 @@
 <div id="help"></div>
 <div id="panel"></div>
 <div id="layers"></div>
+<div id="designs"></div>
 <div id="bar"><label for="jump">go to x, y nm&nbsp;</label><input id="jump" spellcheck="false"
   placeholder="482100, 918400"><span class="note">&nbsp;&nbsp;enter, esc</span></div>
 <script>
