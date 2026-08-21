@@ -18,8 +18,11 @@ density blocks at the top - and the viewer picks a level from the zoom on a
 rectangle budget. Tiles are binary, laid out so the viewer takes typed-array
 views straight over the bytes and **parses nothing at runtime**.
 
-Everything here runs on a synthetic generator. No real LEF/DEF has been through
-it yet; [docs/roadmap.md](docs/roadmap.md) says what that is expected to settle.
+Most of it runs on a synthetic generator, and one real design has now been
+through it — ISPD 2015's `mgc_superblue16_a`, 4,634 real MACRO and 680,869 real
+COMPONENTS, via `tools/import-def.js`. It moved the numbers: see
+[Real data](#real-data) below, and the section of the same name in
+[docs/tile-format.md](docs/tile-format.md) for what the format got wrong.
 
 New to chip design? Start with the [domain primer](domain-primer.md) - it builds
 up from "a chip is printed, not assembled" to the file formats and architectural
@@ -154,6 +157,59 @@ open all day - grouped rows with parent toggles, V and S as separate columns, an
 instance categories listed alongside physical layers. Theirs has a fourth column,
 M, whose meaning is not known here; `COLUMNS` in `src/panel.js` is where it goes
 when it is.
+
+## Real data
+
+Every number in this repo used to come from a generator written to match the
+format, while the format was written to match the generator. `tools/import-def.js`
+breaks that loop by reading a file nobody here wrote:
+
+```sh
+node tools/import-def.js --dir path/to/mgc_superblue16_a --place rows --out data-sb16
+node tools/dev.js check --data data-sb16
+```
+
+It is deliberately throwaway — the parser that matters is being written
+elsewhere — and it parses only `MACRO/SIZE/CLASS/PIN/OBS` out of `cells.lef` and
+`UNITS/DIEAREA/ROWS/COMPONENTS` out of the DEF, then hands the same design object
+`tools/layout.js` produces to the same writer. The benchmark is not in this repo;
+it is [the ISPD 2015 contest archive](http://www.ispd.cc/contests/15/web/benchmarks/ispd_2015_contest_benchmark.tgz).
+
+**Two things it found immediately.**
+
+`floorplan.def` has no placement in it. ISPD 2015 was a *placement* contest, so
+its benchmarks are placer inputs: 680,450 components are `+ UNPLACED` and the
+only 419 with coordinates are the macros. `--place rows` fills the DEF's own rows
+at the design's own 47.6% utilisation and the manifest records that it did; the
+import refuses to run without the flag. Library, die, rows, master mix, instance
+names and the fixed macros are real. Which row and which x are not.
+
+And **a real cell is a box and a handful of pins.** That is what LEF is:
+
+| | synthetic | superblue16 |
+|---|---|---|
+| **rects per placement** | **8.85** | **4.39** (3.39 without the `SIZE` box) |
+| max rects per master | 44 | **4,461** — a macro's OBS block |
+| rect-count spread | unimodal 1…44 | **bimodal**: 4,584 cells at 3…8, 50 macros at up to 4,461 |
+| derived bucket caps | `[3,5,9,10,14,24,32,44]` | `[3,4,5,6,8,118,676,4461]` |
+| bucket padding | 2.0% | **0.2%** (a fixed `[8,16,32,64]` would be 45.2%) |
+| levels written | 6 | **3** — z2 far, z3 mid, z4 deep |
+| deepest level, share of the 2M budget | 77% at its worst frame | **4%** |
+| on disk | 117 MB | 15.9 MB |
+| parse + place + tile, 80.3 MB in | — | **2.4 s** |
+
+Instance names, the measurement three deferred features were waiting on:
+680,869 names, 4.63 MB of UTF-8, mean 7.14 bytes, p95 11, 7.5% hierarchical —
+**7.23 MB as a side table**, or +2.72 MB per deep/mid level in the record. The
+names in this benchmark are anonymised (`o12345`, `MAS4633`), so 7.14 bytes is a
+floor.
+
+`docs/tile-format.md` has the full run under **Real data: superblue16**,
+including the five things the format got wrong — the layer id space being 12
+process ids against a real 17-layer stack (34% of rects folded onto metal3), the
+power grid not being placements of masters at all, two of the four master
+classes having no LEF referent, a runtime gate that assumed a square die, and a
+pin flag nothing reads.
 
 ## Lazy tiles
 
@@ -293,7 +349,8 @@ are in [docs/tile-format.md](docs/tile-format.md).
 
 | Path | What |
 |---|---|
-| `tools/gen.js` | tile generator CLI |
+| `tools/gen.js` | tile generator CLI, and `buildDesign` - the writer both paths share |
+| `tools/import-def.js` | reads a real LEF/DEF into the same design object. Throwaway; see Real data |
 | `tools/layout.js` | synthetic layout: master library, density field, placement |
 | `tools/pyramid.js` | level planning, bucketing, the three tile builders |
 | `tools/format.js` | binary layout constants shared with the docs |

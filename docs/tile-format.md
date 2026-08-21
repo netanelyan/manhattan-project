@@ -1249,6 +1249,196 @@ whatever has already arrived; tiles fold in as they land.
 Coverage bitmaps mean a tile is never requested unless it exists, so empty
 regions of the die cost nothing.
 
+## Real data: superblue16
+
+Every number above this section was measured on `tools/layout.js`, which was
+written to match this format while this format was being written to match it.
+That is a closed loop, and the only way out of it is a file nobody here wrote.
+
+`tools/import-def.js` reads one — ISPD 2015's `mgc_superblue16_a`, 4,634 MACRO
+in `cells.lef` and 680,869 COMPONENTS in `floorplan.def` — and hands the same
+design object `tools/layout.js` produces to the same writer. Nothing downstream
+is told which one it got. It is a throwaway: the parser that matters is being
+written elsewhere, and this one exists to answer questions, not to ship.
+
+### The input is a floorplan, not a placed design
+
+The first thing it measured was that the file does not contain what it was
+expected to contain:
+
+```
+680,450  + UNPLACED     every standard cell
+    419  + FIXED        the 50 CLASS BLOCK macros, all orient N
+```
+
+ISPD 2015 was a **placement** contest, so its benchmarks are placer *inputs*.
+Every design in the archive is the same. The file carries a real library, a real
+die, real rows, a real master mix and real instance names — and no coordinates.
+
+So `--place rows` fills the DEF's own ROWS with the unplaced components, in DEF
+order, at the design's own 47.6% utilisation, skipping the fixed macros. It is
+not a placer and does not pretend to be: no netlist is read, so nothing that
+talks to anything else ends up near it, and **the density map is flat where a
+real one has structure**. The import refuses to run without the flag, and
+`manifest.provenance` records it. Everything below except the placement is read
+out of the files.
+
+### What a real cell actually is
+
+**A CLASS CORE master is its bounding box and its pins. Nothing else.** No
+diffusion, no poly, no contacts, no local metal — those live in the foundry's
+GDS, which is not what a layout viewer is pointed at. The whole library:
+
+| rects per master | 3 | 4 | 5 | 6 | 7 | 8 |
+|---|---|---|---|---|---|---|
+| CLASS CORE masters | 459 | 1,005 | 1,646 | 1,035 | 149 | 290 |
+
+That is the entire spread: 4,584 masters, 3 to 8 rectangles each, where one of
+them is the `SIZE` box this importer emits and the rest are `metal1` pin shapes
+of about 56 × 84 nm. The 50 CLASS BLOCK masters are a different animal
+entirely — 5, 19, 20, 74…155, 676, and 4,366…4,461 — because a macro's OBS
+block is hundreds of rectangles.
+
+| | synthetic | superblue16 |
+|---|---|---|
+| **rects per placement** | **8.85** | **4.39**, or **3.39** without the SIZE box |
+| max rects per master | 44 | **4,461** |
+| rects in the library | 95,784 | 74,066 |
+| rect-count spread | unimodal, 1…44 | **bimodal**: a spike at 3…8 and a tail at 4,461 |
+
+On screen the difference is not subtle. The generator's deep level is a dense
+weave of coloured stripes. superblue16's deep level is grey boxes on black with
+a scattering of blue dots in them, and it spends **4% of the rectangle budget
+where the synthetic design's worst frame spends 77%**.
+
+### What that moved
+
+The bucket caps are solved per design from the placement-weighted rect-count
+histogram, and this is exactly the case that was built for:
+
+| | synthetic | superblue16 |
+|---|---|---|
+| derived caps | `[3,5,9,10,14,24,32,44]` | `[3,4,5,6,8,118,676,4461]` |
+| padding | 2.0% | **0.2%** |
+| fixed `[8,16,32,64]` would be | 41.7% | **45.2%** |
+
+Five of the eight buckets go to the standard-cell spike and three to the macro
+tail. Deriving the caps is what keeps the padding at 0.2% across a distribution
+three orders of magnitude wide; a fixed cut would have wasted 45% of every
+submitted vertex.
+
+The ladder is shorter and the levels sit differently, because 680k placements on
+a 1.488 × 1.616 mm die is a different shape of problem from 5M on a square one:
+
+| | synthetic 5M | superblue16 |
+|---|---|---|
+| levels written | z0–z4 far/mid, z6 deep (6) | z2 far, z3 mid, z4 deep (**3**) |
+| shadowed, not written | z5 | z0, z1 |
+| deep tile | 38.8 µm, p95 14,752 rects | 101 µm, p95 **45,628** rects |
+| content bleed, deep | 6.2 µm | 12.0 µm |
+| overflow, deep | 9,609 placements, 0.5% of budget | 99 placements, **3.5%** of budget |
+| density p5…p95 | 28…56% | 8…53% |
+| on disk | 117 MB | **15.9 MB** |
+
+### Parse and tile time
+
+Single-threaded, no optimisation, 80.3 MB of input:
+
+| | |
+|---|---|
+| read all three files | 58 ms |
+| `cells.lef`, 4,634 MACRO | 0.26 s |
+| `floorplan.def`, 680,869 COMPONENTS | 0.85 s (~88 MB/s, ~800k components/s) |
+| synthesize placement | 243 ms |
+| bucket, plan, density | 46 ms |
+| write 316 tiles, 15.9 MB | 0.5 s |
+| **total** | **2.4 s** |
+
+### Instance names, measured at last
+
+The names decision has been deferred pending real data since it was first
+written down. The data:
+
+| | |
+|---|---|
+| names | 680,869 |
+| bytes of UTF-8 | 4,860,141 (4.63 MB) |
+| length min / p50 / p95 / max | 2 / 7 / 11 / 11 |
+| mean | 7.14 bytes |
+| hierarchical (contain `/`) | 51,292, 7.5% |
+| as a side table (text + `u32` offset) | **7.23 MB** |
+| in the placement record (12 → 16 bytes) | **+2.72 MB per deep or mid level** |
+
+**These names are anonymised.** superblue16's instances are `o12345` and
+`h1b/o680868`; its masters are `MAS0`…`MAS4633`. A design that has not been
+scrubbed carries names like `u_core/dp/alu/add_i0/U1234`, and 7.14 bytes is a
+floor, not an estimate. What the measurement does settle is the *shape* of the
+answer: the side file is 1.5× the text because the offset table is 4 bytes
+against a 7-byte mean, so a `u16`-relative offset scheme would be worth having,
+and 7.5% of names being hierarchical means a shared-prefix table is worth
+measuring before a flat one is chosen.
+
+### What the format got wrong
+
+Five things, in the order they cost something.
+
+**1. The layer id space is not close to a real stack.** `tech.lef` declares
+`metal1`…`metal9` and `via1`…`via8` — 17 routing layers. This format has 12
+process ids *in total*, of which three are metal and two are via-ish, because
+the id space also has to hold nwell, diff, poly, contact, pin, macro, power and
+the three instance categories inside sixteen. **25,250 of 74,066 rects — 34% —
+landed on a layer with no id and were folded onto metal3.** That is why a macro
+renders as a solid purple slab: its `metal5` pins and `metal4` obstruction all
+collapse onto one id. This was already written down as a known gap; it is now a
+measurement rather than a prediction, and it is the one change worth making
+first. See "The layer stack is three metals wide".
+
+**2. The power grid is not placements of masters.** `tools/layout.js` models the
+grid as ~1M placements of power-strap masters with `klass = PWR`, and
+`collectStructures` coalesces them into the far levels' strap boxes. A real
+design has power in **SPECIALNETS**, as named nets carrying routed stripes with
+a width — geometry, not instances. superblue16's `vdd` and `vss` are exactly
+that. So `K.PWR` has no LEF counterpart at all, `collectStructures` found **0
+straps**, and `LAYER_POWERBOX` and the layer panel's "power grid" row are empty
+on real data. The format's "everything on screen is a placement of a master"
+does not hold for the power grid, and the fix is a fourth tile representation or
+a per-level strap list, not a class flag.
+
+**3. Two of the four classes have no referent.** `masters.bin` carries standard
+cell / macro / power / filler. LEF's `CLASS` gave **CORE 4,584 and BLOCK 50**,
+and nothing else. There is no filler because filler is inserted *after*
+placement and a floorplan DEF has none; there is no power class for the reason
+above. So the far tile's **filler density channel is identically zero** — the
+"nearly flat on synthetic data" gap is worse than flat on real data, it is
+absent — and colour-by-class has two live colours out of four.
+
+**4. The runtime gate assumed a square die.** `holePoints()` in the blank check
+treats an empty run of tiles enclosed by non-empty ones as a macro promoted to
+the overflow list. The world is square and superblue16's die is not, so the
+128 µm margin between `die.w` and `world.size` is a whole empty tile column that
+borders the die — and the gate sampled it, found nothing, and failed:
+`0 lit pixels ... at block 1565500,808000` against a die 1,488,000 nm wide. The
+generator makes a die that fills the square world exactly, so this could not
+have been found on synthetic data at all. Fixed by restricting the fill to tiles
+that overlap the die.
+
+**5. The pin flag is carried and never read.** A rect record's second word is
+`flags`, set to 1 for pin geometry, and no shader reads it. On synthetic data
+that was invisible; on real data it is the *only* thing distinguishing a pin
+from an obstruction, since both are rectangles on a metal layer. It wants to be
+a layer-panel row, not a dead field.
+
+Two things the format got **right**, worth recording because they were the parts
+most likely to break:
+
+- **Deriving the bucket caps rather than fixing them.** A real library is
+  bimodal across three orders of magnitude; a fixed cut would have padded 45%.
+- **Overflow promotion.** Every one of the 50 macros is 230 × 90 µm, oversized
+  at every level, and the mechanism put them in a 1.3 KB per-level list instead
+  of inflating content bleed to a macro's width.
+
+---
+
 ## Known gaps
 
 Everything above describes what the format does. This is what it does not,
@@ -1258,35 +1448,32 @@ matters, which is not the order of how much work each one is.
 
 ### Deep zoom shows cell internals that a real LEF does not have
 
-**This is the assumption in the project most likely to be wrong.** The deep
-representation draws ~11 rectangles per placement - diffusion strips, poly
-gates, contacts, local metal1, pins - because that is what `tools/layout.js`
-invents for a standard cell, and the deep level exists to have something worth
-drawing at the bottom of the zoom range.
+**Confirmed.** This was the assumption in the project most likely to be wrong,
+and it was wrong. It is left here rather than deleted because the prediction and
+the measurement are worth reading next to each other; the numbers are under
+"Real data: superblue16".
+
+The deep representation draws ~8.8 rectangles per placement - diffusion strips,
+poly gates, contacts, local metal1, pins - because that is what
+`tools/layout.js` invents for a standard cell.
 
 A real `cells.lef` does not contain that. It gives a cell's bounding box, its
-**pin shapes**, and its **obstructions** - the regions routing must avoid. The
-transistor-level internals live in the foundry's GDS, which is not what a layout
-viewer is pointed at. So the deepest level may be drawing a thing with no
-counterpart in the input.
+**pin shapes**, and its **obstructions**. The transistor-level internals live in
+the foundry's GDS, which is not what a layout viewer is pointed at.
 
-What would move if that holds:
+What was predicted to move, and what actually moved:
 
-- the rects-per-placement figure the deep level is budgeted against. Pins plus
-  obstructions is plausibly fewer than 11, which would shift every switch point
-  and might make another level deep;
-- the rect-count histogram, and with it the derived bucket caps and the padding
-  figure. The caps are solved from the design's own histogram precisely so this
-  is a re-solve rather than a redesign - but the shipped numbers would change;
-- what "deep" means as a representation. It may be closer to "pins and
-  obstructions" than to "internals", which is a different picture on screen even
-  though it is the same byte layout.
+| predicted | measured on superblue16 |
+|---|---|
+| "plausibly fewer than 11" rects per placement | **4.39**, or 3.39 without the SIZE box |
+| the histogram, and the derived caps with it | caps went from unimodal `[3,5,9,10,14,24,32,44]` to bimodal `[3,4,5,6,8,118,676,4461]`; padding *fell*, 2.0% → 0.2% |
+| every switch point shifts | 3 levels instead of 6, deep binding on budget at 4.07e-3 instead of 6.54e-3 |
+| "a different picture on screen" | grey boxes with blue dots in them, 4% of the rectangle budget where the synthetic worst frame is 77% |
 
-None of the format changes. The placement record, the bucket table and the
-master rect list carry pins and obstructions exactly as well as they carry
-invented internals. What is untested is whether the *shape* of real geometry
-lands where the budget was aimed - and nothing here can be settled without a
-real LEF. Inventing an answer would be fitting to the generator again.
+The prediction that **none of the format changes** held: the placement record,
+the bucket table and the master rect list carried pins and obstructions without
+a byte moving. What did not hold was the layer id space, which is a separate
+gap below and is now the first thing worth fixing.
 
 ### No names, so no search
 

@@ -588,11 +588,24 @@ function contentPoints(limit) {
 // thing to check, not seventy.
 function holePoints(z) {
   const L = levelOf(z), n = L.tilesPerSide, S = L.tileSize;
+  // The world is square and the die is whatever shape it is, so on a die that
+  // is not square there is an empty margin between the two. It is not a hole -
+  // there is nothing out there to draw - and the fill must not walk into it,
+  // because a tile in the margin touching a tile in the die is "bordered" by
+  // the test below and would be sampled as though a macro had been promoted
+  // out of it.
+  //
+  // This only ever worked because the synthetic generator makes a square die
+  // that fills the world exactly. superblue16 is 1.488 x 1.616 mm, its right
+  // margin is a whole tile column wide, and the gate failed on it: one sample
+  // at x = 1,565,500 nm against a die 1,488,000 nm wide.
+  const die = manifest.die || { w: chip.w, h: chip.h };
+  const inDie = (x, y) => x * S < die.w && y * S < die.h;
   const seen = new Uint8Array(n * n);
   const out = [];
   for (let y0 = 0; y0 < n; y0++) {
     for (let x0 = 0; x0 < n; x0++) {
-      if (seen[y0 * n + x0] || store.exists(z, x0, y0)) continue;
+      if (seen[y0 * n + x0] || store.exists(z, x0, y0) || !inDie(x0, y0)) continue;
       let sx = 0, sy = 0, count = 0, bordered = false;
       const stack = [[x0, y0]];
       seen[y0 * n + x0] = 1;
@@ -603,14 +616,18 @@ function holePoints(z) {
           const nx = x + dx, ny = y + dy;
           if (nx < 0 || ny < 0 || nx >= n || ny >= n) continue;
           if (store.exists(z, nx, ny)) { bordered = true; continue; }
-          if (seen[ny * n + nx]) continue;
+          if (seen[ny * n + nx] || !inDie(nx, ny)) continue;
           seen[ny * n + nx] = 1;
           stack.push([nx, ny]);
         }
       }
-      // Only enclosed holes: the empty margin outside the die is not a hole,
-      // and there is nothing to draw there.
-      if (bordered) out.push([(sx / count + 0.5) * S, (sy / count + 0.5) * S]);
+      // Only enclosed holes: an empty run that touches nothing is outside the
+      // design, and there is nothing to draw there either.
+      if (!bordered) continue;
+      // A hole against the die edge has its tile centre outside the die when
+      // the edge cuts that tile, so the point is pulled back inside.
+      out.push([Math.min((sx / count + 0.5) * S, die.w - 1),
+                Math.min((sy / count + 0.5) * S, die.h - 1)]);
     }
   }
   return out;

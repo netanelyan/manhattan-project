@@ -16,8 +16,13 @@ indexes placements instead of writing deep tiles, a WebGL2 viewer that parses
 nothing at runtime, and two gates - one that reads the binaries back and one
 that drives the real viewer in a browser and fails on an empty frame.
 
-The one thing it has never seen is a real LEF/DEF. That is the next item, and it
-is the item most of the others are waiting behind.
+One real design has now been through it. `tools/import-def.js` reads ISPD 2015's
+`mgc_superblue16_a` — 4,634 MACRO, 680,869 COMPONENTS — and builds the pyramid
+through the same writer the generator uses; `verify` and `make check` pass on the
+result. It is a throwaway parser aimed at questions, not the real one, and it
+settled several of them at once. Full run in
+[tile-format.md](tile-format.md#real-data-superblue16); the short version is
+under "What real data changed", below.
 
 ## Done
 
@@ -47,27 +52,53 @@ is the item most of the others are waiting behind.
 
 Ordered by what unblocks the most.
 
-### 1. Read a real LEF/DEF
+### 1. A wider layer id space
 
-Everything above runs on `tools/layout.js`. The format was designed against real
-file structure and the library size was matched to a real `cells.lef` (4,634
-masters), but no real file has been through it.
+Promoted to the top by real data, and it is now the only thing the import found
+that the format cannot carry at all.
 
-What it settles, in the order it settles them:
+`mgc_superblue16_a/tech.lef` declares `metal1`…`metal9` and `via1`…`via8`:
+**seventeen routing layers**. This format has twelve process ids in total,
+because sixteen ids also have to hold nwell, diff, poly, contact, pin, macro,
+power and the three instance categories. **25,250 of 74,066 library rects — 34%
+— had no id and were folded onto metal3**, which is why a macro renders as one
+purple slab instead of pins on metal5 over an obstruction on metal4.
 
-- whether cell internals at deep zoom are the right thing to draw at all - a
-  real LEF has pin shapes and obstructions and **no internals**, so the deepest
-  level may be showing something that does not exist. This is the assumption in
-  the whole project most likely to be wrong;
-- how long instance names are, and how many power nets a design carries and what
-  they are called, which is the input the names decision is waiting on;
-- parse throughput, which is the one cost in the pipeline never measured;
-- whether the filler distribution assumption holds (the synthetic one is nearly
-  flat, and the faithful model was measured and reverted - see Known gaps in
-  the format doc).
+**Cost:** re-cut the depth key from `1 - layer/16` to more bits, and widen
+`u_layerMask` past 16. That touches the three vertex shaders, the palette, the
+two half-masks the layer panel is built on, and `PROCESS_MASK`/`CATEGORY_MASK`
+in `src/format.js`. Mechanical, bounded, and now backed by a measurement of what
+a real stack is rather than a guess. See Known gaps in the format doc.
 
-**Cost:** unmeasured, and deliberately not guessed. Parsing is a known quantity
-in itself; what is not known is what the shapes look like coming out.
+### 1b. What real data changed, and what is still open
+
+`tools/import-def.js` settled four of the five questions this item used to be
+about. Recorded here so the list is not read as still open:
+
+| question | answer |
+|---|---|
+| are cell internals at deep zoom the right thing to draw? | **No.** A real cell is a `SIZE` box and 2–7 `metal1` pins. 4.39 rects per placement against the generator's 8.85, and the deepest level spends 4% of the rectangle budget where the synthetic worst frame spends 77% |
+| how long are instance names? | 680,869 names, mean **7.14 bytes**, p95 11, 4.63 MB of text, 7.23 MB as a side table. But **anonymised** in this benchmark, so that is a floor |
+| how many power nets, and what are they called? | `vdd` and `vss`, in **SPECIALNETS** — routed stripes with a width, not placements of masters. Still unanswered for a design with real domain names |
+| parse throughput? | 80.3 MB read, parsed, placed and tiled in **2.4 s** single-threaded; the 75 MB DEF alone parses in 0.85 s |
+| does the filler distribution assumption hold? | **Unanswerable from a floorplan.** Filler is inserted after placement, so a placer-input DEF has none, and the far tile's filler channel is identically zero |
+
+What is still open, and now needs a *placed* design rather than another
+floorplan: real placement density (this one had to be synthesized), the filler
+question, and un-anonymised names.
+
+### 1c. A design that is actually placed
+
+Every benchmark in the ISPD 2015 archive is a placement-contest input, so all
+680,450 standard cells arrive `+ UNPLACED`. `--place rows` fills the DEF's own
+rows at the design's own utilisation, which is enough to exercise the pyramid at
+scale but is flat where a real placement has structure — so the far levels'
+density map, the one thing the whole full-die view exists to show, is the one
+thing not yet tested against reality.
+
+**Cost:** finding the file, not writing code; the importer already reads
+`+ PLACED` and `+ FIXED`. An ISPD 2014/2013 incremental-timing benchmark, an
+OpenROAD flow output, or the placer output for this same design would all do.
 
 ### 2. Master names
 

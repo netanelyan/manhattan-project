@@ -194,7 +194,10 @@ function writeMasters(dir, gen) {
   buf.writeUInt16LE(F.VERSION, 4);
   buf.writeUInt16LE(0, 6);
   u32[2] = nM; u32[3] = nR; u32[4] = mastersOff; u32[5] = rectsOff;
-  u32[6] = layout.DBU_PER_MICRON; u32[7] = layout.ROW_H;
+  // Off the design rather than off the synthetic layout module: a real LEF/DEF
+  // states its own database units and row height, and they are not ours to
+  // assume. The synthetic generator reports the same constants it always did.
+  u32[6] = gen.dbuPerMicron; u32[7] = gen.rowH;
 
   let p = mastersOff >> 2;
   for (const m of gen.masters) {
@@ -209,9 +212,18 @@ function writeMasters(dir, gen) {
   return { bytes: total, masterCount: nM, rectCount: nR };
 }
 
-// ---------------------------------------------------------------- main
-async function main() {
-  const opts = parseArgs(process.argv.slice(2));
+// ---------------------------------------------------------------- build
+//
+// Everything from here down is design-independent: it takes a placement list
+// and a master library and writes the pyramid. `gen` is whatever produced them
+// - tools/layout.js for the synthetic design, tools/import-def.js for a real
+// LEF/DEF - and the contract between them is the object described in
+// docs/tile-format.md under "The design object".
+//
+// It is one function rather than two copies because the alternative was tried
+// elsewhere in this repo and is why `make gen` runs `verify` itself: a writer
+// and a second writer drift, and nothing on disk says which one is stale.
+async function buildDesign(gen, opts, summary) {
   // The ladder and the block -> chip transform are the viewer's own modules,
   // imported rather than reimplemented: they are the arithmetic both sides have
   // to agree on exactly, and two copies would be two chances to disagree.
@@ -221,14 +233,9 @@ async function main() {
   fs.rmSync(path.join(outDir, 'tiles'), { recursive: true, force: true });
   fs.mkdirSync(outDir, { recursive: true });
 
-  process.stdout.write(`generating ${fmt(opts.count)} instances (seed ${opts.seed})... `);
-  const gen = layout.generate(opts);
   const n = gen.instances.n;
-  console.log(`${gen.genMs}ms`);
   console.log(`  die         ${um(gen.dieW)} x ${um(gen.dieH)}  (${gen.numRows} rows)`);
-  console.log(`  instances   ${fmt(n)} = ${fmt(gen.stdCount - gen.fillCount)} logic + ${fmt(gen.fillCount)} filler + ` +
-              `${fmt(gen.pwrCount)} power + ${gen.macroCount} macros` +
-              `  (straps ${gen.strapAligned ? 'tile-aligned' : 'unaligned'}, ${um(gen.strapSeg)} segments)`);
+  if (summary) console.log(summary);
   console.log(`  masters     ${fmt(gen.masters.length)}, ${fmt(gen.rects.length / 8)} rects, ` +
               `${gen.meanRects.toFixed(1)} rects/placement avg, max ${gen.masters.reduce((a, m) => Math.max(a, m.rectCount), 0)} per master`);
 
@@ -545,7 +552,7 @@ async function main() {
   let indexInfo = null;
   if (opts.lazy && !opts.oneTile) {
     const ti = Date.now();
-    const pack = IX.planPacking(gen, tileSize, layout.SITE_W, layout.ROW_H);
+    const pack = IX.planPacking(gen, tileSize, gen.siteW, gen.rowH);
     indexInfo = IX.writeIndex(outDir, gen, bucket, pack);
     indexInfo.ms = Date.now() - ti;
     const per = indexInfo.recordBytes;
@@ -564,9 +571,9 @@ async function main() {
   const manifest = {
     version: F.VERSION,
     seed: opts.seed,
-    dbuPerMicron: layout.DBU_PER_MICRON,
-    rowHeight: layout.ROW_H,
-    siteWidth: layout.SITE_W,
+    dbuPerMicron: gen.dbuPerMicron,
+    rowHeight: gen.rowH,
+    siteWidth: gen.siteW,
     die: { w: gen.dieW, h: gen.dieH },
     world: { size: worldSize },
     maxZ,
@@ -600,6 +607,11 @@ async function main() {
     oversizeFrac: F.OVERSIZE_FRAC,
     maxRectsPerMaster: maxRects,
     strapAligned: gen.strapAligned,
+    // What produced this. A pyramid built from a real LEF/DEF and one invented
+    // by the generator are the same bytes and are not the same evidence, so the
+    // manifest says which it is rather than leaving it to the directory name.
+    source: gen.source || 'synthetic',
+    ...(gen.provenance ? { provenance: gen.provenance } : {}),
     partial: opts.oneTile,
     // Absent, not null, when generation was not lazy: a full run's manifest has
     // to stay byte-for-byte what it was before any of this existed.
@@ -650,4 +662,18 @@ async function main() {
   }
 }
 
-main().catch(e => { console.error(e); process.exit(1); });
+// ---------------------------------------------------------------- main
+async function main() {
+  const opts = parseArgs(process.argv.slice(2));
+  process.stdout.write(`generating ${fmt(opts.count)} instances (seed ${opts.seed})... `);
+  const gen = layout.generate(opts);
+  console.log(`${gen.genMs}ms`);
+  await buildDesign(gen, opts, `  instances   ${fmt(gen.instances.n)} = ` +
+    `${fmt(gen.stdCount - gen.fillCount)} logic + ${fmt(gen.fillCount)} filler + ` +
+    `${fmt(gen.pwrCount)} power + ${gen.macroCount} macros` +
+    `  (straps ${gen.strapAligned ? 'tile-aligned' : 'unaligned'}, ${um(gen.strapSeg)} segments)`);
+}
+
+module.exports = { buildDesign, parseCount };
+
+if (require.main === module) main().catch(e => { console.error(e); process.exit(1); });

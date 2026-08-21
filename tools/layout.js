@@ -379,6 +379,11 @@ function generate(opts) {
       m: im.subarray(0, n), o: io.subarray(0, n), n,
     },
     dieW, dieH, numRows,
+    // The units this design is stated in. Constants here, read out of the files
+    // by a real importer; either way tools/gen.js takes them off the design
+    // rather than off this module.
+    dbuPerMicron: DBU_PER_MICRON, rowH: ROW_H, siteW: SITE_W,
+    source: 'synthetic',
     maxZ, tilesPerSide, tileSize, worldSize,
     macroCount, pwrCount,
     stdCount: n - macroCount - pwrCount,

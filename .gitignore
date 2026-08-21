@@ -1,2 +1,5 @@
 data/
 node_modules/
+# imported designs and any other generated pyramid: data/ by default,
+# data-<name>/ for anything tools/import-def.js writes. Never the benchmark.
+data-*/
