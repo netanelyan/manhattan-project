@@ -35,6 +35,7 @@ is the item most of the others are waiting behind.
 | block instances, the chip level | 70 instances of a 5M block = 349M placements; chip view is **1 tile fetched, 70 draws** |
 | density that reads as structure: logic and filler channels, hue ramp over the design's own p5..p95 | |
 | layer visibility, solo, per-layer alpha, colour by class, tile overlay | all uniforms; nothing rebuilds a buffer |
+| the layer panel: grouped rows, parent toggles, visible and selectable as separate axes | 15 rows in 5 groups, process layers and instance categories in one list; the instance categories were unfilterable at any zoom before it |
 | click to identify, jump to coordinate | the tile is the spatial index; no parallel structure |
 | the view in the URL | position, scale, level, layers, colour, solo, selection |
 | lazy tiles: far levels plus a placement index, deep tiles produced on request | 50M design: 1,185 MB → 233 MB, 62 s → 15 s, p50 0.22 ms to produce a deep tile |
@@ -58,8 +59,8 @@ What it settles, in the order it settles them:
   real LEF has pin shapes and obstructions and **no internals**, so the deepest
   level may be showing something that does not exist. This is the assumption in
   the whole project most likely to be wrong;
-- how long instance names are, which is the input the names decision is waiting
-  on;
+- how long instance names are, and how many power nets a design carries and what
+  they are called, which is the input the names decision is waiting on;
 - parse throughput, which is the one cost in the pipeline never measured;
 - whether the filler distribution assumption holds (the synthetic one is nearly
   flat, and the faithful model was measured and reverted - see Known gaps in
@@ -90,6 +91,16 @@ The side file is the better trade - identification is interactive, streaming is
 not. **Blocked on item 1**: how many bytes this actually costs depends on how
 long real names are, and inventing a length would be fitting to nothing.
 
+**Decide power nets at the same time.** The format has one power layer and one
+power category, and every strap in the design draws on them; a real design has
+named rails, and the tool the target users have lists them individually -
+`VDD`, `VSS`, `PCIE_UTIL_VPH_X4_1` and a long tail. Naming the nets is small on
+its own - tens of names, not millions - but it wants a field on the placement
+record or a per-tile side list, which is the same format decision instance names
+make. Taking that decision without the case that most wants a field in it would
+settle the record layout with a third of the problem left out of the room. See
+"One undifferentiated power layer, and no named nets" in the format doc.
+
 ### 4. Several distinct blocks in one chip
 
 `chip.json` already lists `blocks[]` and every instance names one. The viewer
@@ -111,7 +122,21 @@ Not done because it costs a per-level quantum in the format contract, and lazy
 tiles took most of the pressure off: the 50M design is 233 MB on disk, not
 1,185 MB. Reconsider if size becomes the binding constraint again.
 
-### 6. Screenshots for the stress findings
+### 6. A layer stack as wide as a real one
+
+The generator emits three metals and two vias. A real stack is ten and ten, and
+that is what the reference panel lists. The viewer side is already built for it:
+the layer panel is a table of rows and groups, and the parent toggles exist
+because ten metals is where a flat list stops being usable.
+
+**Cost:** the generator side is a bigger library and more `pushRect` calls. The
+format side is not free - **the layer id space is full at 16** and the depth key
+is `1 - layer/16`, so twenty routing layers means re-cutting the key to more
+bits, which touches the vertex shader, the palette and both half-masks. Worth
+doing when a real stack says how wide it needs to be, which puts it behind
+item 1. See Known gaps in the format doc.
+
+### 7. Screenshots for the stress findings
 
 `docs/img/` is three PNGs short and `docs/renderer-findings.md` has the image
 lines commented out waiting for them. See `docs/img/README.md` for what to

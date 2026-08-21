@@ -16,7 +16,8 @@
 
 import { viewMasters, KIND_NAME, key, overflowKey } from './format.js';
 import { Camera, attachControls } from './camera.js';
-import { Renderer, LAYER_NAMES, TOGGLE_LAYERS, CLASS_LAYER_NAMES } from './renderer.js';
+import { Renderer, LAYER_NAMES, CLASS_LAYER_NAMES, ALPHA_PRESET } from './renderer.js';
+import { LayerPanel, ROWS, KEY_ROWS, soloMask, appliesAt, isCategory } from './panel.js';
 import { TileStore, PRIORITY } from './tiles.js';
 import { deriveLadder, LevelPicker, viewOf } from './lod.js';
 import { Chip, singleInstance, rectToBlock } from './chip.js';
@@ -34,6 +35,7 @@ const hud = document.getElementById('hud');
 const notice = document.getElementById('notice');
 const help = document.getElementById('help');
 const panel = document.getElementById('panel');
+const layersEl = document.getElementById('layers');
 const bar = document.getElementById('bar');
 const jumpInput = document.getElementById('jump');
 const gl = canvas.getContext('webgl2', { antialias: false, depth: true });
@@ -49,6 +51,11 @@ let wantZ = 0, useZ = 0, clamped = false;
 let ladder = null, picker = null, auto = true, chipNote = '';
 let visibleKeys = [], instanceDraws = [], lastCandidates = 0, uniqueTiles = 0;
 let status = 'loading...';
+// Which layers a click may land on. Separate from the visible mask on purpose:
+// showing a macro and letting it swallow every click on the cells underneath it
+// are different questions. See src/panel.js.
+let selectMask = 0xffff;
+let layerPanel = null;
 
 let levelZs = [];                       // levels that exist, ascending
 const levelOf = z => levelByZ.get(z);
@@ -318,12 +325,23 @@ async function boot() {
   }
   if (params.has('tiles')) renderer.showTiles = true;
   if (params.has('mask')) renderer.layerMask = parseInt(params.get('mask'), 0);
+  if (params.has('sel')) selectMask = parseInt(params.get('sel'), 0) & 0xffff;
   if (params.has('color')) renderer.colorMode = +params.get('color') ? 1 : 0;
   if (params.has('minpx')) renderer.minPx = +params.get('minpx');
-  if (params.has('alpha')) setTranslucent(renderer, +params.get('alpha') !== 0);
+  if (params.has('alpha')) setAlphaMask(renderer, params.get('alpha'));
   if (params.has('solo')) solo(renderer, +params.get('solo'));
   if (params.has('blocks')) renderer.blockBounds = +params.get('blocks') !== 0;
   if (params.has('hud')) setHudMode(Math.max(0, HUD_KEYS.indexOf(params.get('hud'))));
+  layerPanel = new LayerPanel(layersEl, {
+    renderer,
+    getSelect: () => selectMask,
+    setSelect: m => { selectMask = m; },
+    // A click in the V column is a mask edit like any other, so it leaves solo
+    // the same way a layer key does - the soloed state no longer describes what
+    // is on screen once something else has been turned on beside it.
+    onChange: axis => { if (axis === 'v') soloLayer = -1; syncUrl(); },
+  });
+  layerPanel.on = params.get('panel') !== '0';
 
   refresh();
   await store.settle();      // only so scripted runs are deterministic
@@ -764,7 +782,8 @@ function refreshSelection() {
 }
 
 function identifyAt(cx, cy) {
-  selection = pick(cx, cy, { chip, store, level: levelOf(useZ), masters: renderer.masters });
+  selection = pick(cx, cy,
+    { chip, store, level: levelOf(useZ), masters: renderer.masters, selectMask });
   // The click is the point, whether or not something was under it. Forgetting a
   // miss would mean the readout could never come back when the level that does
   // hold geometry there arrives.
@@ -772,7 +791,7 @@ function identifyAt(cx, cy) {
   pickZ = useZ;
   // The hit, in chip space. Every orientation is axis-preserving, so the two
   // transformed corners are the rect - no rotated outline to draw.
-  if (selection) {
+  if (selection && selection.kind !== 'filtered') {
     const T = selection.inst.T;
     const ax = T.toChipX(selection.x, selection.y), ay = T.toChipY(selection.x, selection.y);
     const bx = T.toChipX(selection.x + selection.w, selection.y + selection.h);
@@ -800,6 +819,17 @@ function drawPanel(cx, cy) {
   }
   const inst = s.inst;
   const where = `block instance ${inst.i} / ${chip.count}  ${ORIENT_NAME[inst.orient]} at ${nm(inst.x)}, ${nm(inst.y)}`;
+
+  // A filter that turns a hit into silence looks exactly like a viewer that has
+  // stopped working, so the miss says which filter it was.
+  if (s.kind === 'filtered') {
+    panel.textContent =
+`not selectable   ${s.count} ${s.count === 1 ? 'thing is' : 'things are'} under ${nm(cx)}, ${nm(cy)}, and the S column excludes all of them
+             ${where}
+             tile   z${s.z} ${s.tx}/${s.ty}   turn the row back on in the layer panel (shift+l)`;
+    panel.classList.add('on');
+    return;
+  }
 
   if (s.kind === 'placement') {
     panel.textContent =
@@ -922,7 +952,10 @@ function writeUrl() {
   // alpha: what the URL writes it can read back, without every shared link
   // carrying the state it would have had anyway.
   if (hudMode !== HUD_FULL) p.set('hud', HUD_KEYS[hudMode]); else p.delete('hud');
-  if (renderer.translucent) p.set('alpha', '1'); else p.delete('alpha');
+  const am = alphaMask(renderer);
+  if (am) p.set('alpha', '0x' + am.toString(16)); else p.delete('alpha');
+  if (selectMask === 0xffff) p.delete('sel'); else p.set('sel', '0x' + selectMask.toString(16));
+  if (layerPanel && !layerPanel.on) p.set('panel', '0'); else p.delete('panel');
   if (pickPoint) p.set('pick', `${Math.round(pickPoint[0])},${Math.round(pickPoint[1])}`);
   else p.delete('pick');
 
@@ -943,15 +976,28 @@ function onCameraChange() {
 
 attachControls(canvas, cam, onCameraChange, identify);
 window.addEventListener('resize', () => { resize(); onCameraChange(); });
-// Alpha for the translucent path. Everything a process engineer wants to see
-// through is routing: metal over via over metal. The lower layers stay nearly
-// opaque so the cell still reads as a cell.
-const ALPHA_PRESET = [1, 1, 0.85, 0.85, 0.8, 0.55, 0.6, 0.5, 0.45, 0.7, 0.9, 0.5, 1, 1, 1, 1];
 
-function setTranslucent(R, on) {
-  R.translucent = on;
-  for (let i = 0; i < 16; i++) R.layerAlpha[i] = on ? ALPHA_PRESET[i] : 1;
+// ---------------------------------------------------------------- alpha
+//
+// Which layers are see-through, as a mask. It used to be one flag for all of
+// them, because `v` was the only way to set it; the panel's C column sets one
+// layer at a time, so the state is per layer and `v` is the shortcut that
+// writes every bit of it at once. The preset itself lives in the renderer,
+// beside the palette it belongs with.
+const alphaMask = R => {
+  let m = 0;
+  for (let i = 0; i < 16; i++) if (R.layerAlpha[i] < 1) m |= 1 << i;
+  return m;
+};
+
+// `alpha=1` is what links written before this carried, and it meant all of
+// them, so it still does. Anything else is read as the mask itself.
+function setAlphaMask(R, text) {
+  const m = (text === '1' || text === 'all') ? 0xffff : (parseInt(text, 0) & 0xffff);
+  for (let i = 0; i < 16; i++) R.layerAlpha[i] = (m >> i) & 1 ? ALPHA_PRESET[i] : 1;
 }
+
+const setAllAlpha = (R, on) => setAlphaMask(R, on ? 'all' : '0');
 
 // ---------------------------------------------------------------- display
 //
@@ -980,18 +1026,20 @@ const HELP_GROUPS = [
     ['f', 'fit the die'],
     ['g', 'go to an x, y coordinate in nm'],
     ['click', 'identify what is under the cursor'],
-    ['esc', 'dismiss the panel or the coordinate box'],
+    ['esc', 'dismiss the identify readout or the coordinate box'],
   ]],
   ['level', [
     ['l', 'automatic / manual LOD level'],
     ['[  ]', 'force the level down / up (switches to manual)'],
   ]],
   ['layers', [
-    ['1-9', 'toggle a layer'],
-    ['shift+1-9', 'solo a layer, hide the rest'],
+    ['shift+l', 'the layer panel: visible, selectable, colour'],
+    ['1-9  0', 'toggle a layer, reading down the panel'],
+    ['shift+1-9', 'solo a layer, hide the rest of its half of the stack'],
     ['a', 'all layers on / off'],
-    ['v', 'per-layer alpha, see through the stack'],
-    ['', 'far and mid levels carry no layer identity, so filters do not apply there'],
+    ['v', 'see through every layer that has a preset; the panel does one'],
+    ['', 'a deep level draws process layers and a coarser one draws instance'],
+    ['', 'categories, so the panel dims the rows that cannot apply here'],
   ]],
   ['display', [
     ['d', 'HUD: full / one line / off'],
@@ -1027,8 +1075,13 @@ function toggleHelp() {
 
 // Solo: show one layer, hide the rest. Toggling eight layers off to look at one
 // is the thing nobody does twice, so it is one keystroke - shift and the layer's
-// own number. Shift-clicking the soloed layer again restores what was visible
+// own number. Pressing it again on the soloed layer restores what was visible
 // before it, not "everything": coming back to a working set matters.
+//
+// It solos within the layer's own half of the mask - see soloMask in panel.js.
+// Soloing metal2 says nothing about whether macros should be visible at a far
+// level, and taking it to mean "hide those too" would blank every level that
+// has no metal2 to show.
 let soloLayer = -1, maskBeforeSolo = 0xffff;
 
 function solo(R, layer) {
@@ -1038,7 +1091,7 @@ function solo(R, layer) {
     return;
   }
   if (soloLayer === -1) maskBeforeSolo = R.layerMask;
-  R.layerMask = 1 << layer;
+  R.layerMask = soloMask(layer);
   soloLayer = layer;
 }
 
@@ -1059,19 +1112,23 @@ window.addEventListener('keydown', e => {
   if (e.key === '?' || e.key === 'h') { toggleHelp(); return; }
   if (e.key === 'g') { e.preventDefault(); openJump(); return; }
   // e.code, not e.key: shift turns '1' into '!' and the layer keys have to keep
-  // working with it held.
-  const digit = /^Digit([1-9])$/.exec(e.code);
+  // working with it held. The digits read straight down the panel, 1-9 then 0,
+  // and they drive a panel row rather than a bare bit, so the key and the row
+  // cannot come to mean different things.
+  const digit = /^Digit([0-9])$/.exec(e.code);
   if (digit) {
-    const layer = TOGGLE_LAYERS[+digit[1] - 1];
-    if (e.shiftKey) solo(R, layer);
-    else { R.layerMask ^= 1 << layer; soloLayer = -1; }
+    const row = KEY_ROWS[(+digit[1] + 9) % 10];
+    if (!row) return;
+    if (e.shiftKey) solo(R, row.l);
+    else { R.layerMask ^= 1 << row.l; soloLayer = -1; }
     syncUrl();
     return;
   }
   switch (e.key) {
     case 'd': setHudMode(hudMode + 1); status = `HUD ${HUD_MODE_NAME[hudMode]}`; break;
     case 'a': R.layerMask = R.layerMask === 0xffff ? 0 : 0xffff; soloLayer = -1; break;
-    case 'v': setTranslucent(R, !R.translucent); break;
+    case 'v': setAllAlpha(R, !R.translucent); break;
+    case 'L': layerPanel.toggle(); status = `layer panel ${layerPanel.on ? 'on' : 'off'}`; break;
     case 'b': R.blockBounds = !R.blockBounds; break;
     case 'c': R.colorMode ^= 1; break;
     case 't': R.showTiles = !R.showTiles; break;
@@ -1118,12 +1175,26 @@ function ladderLine() {
   }).join('');
 }
 
+// The panel is where the layers are read now, so this is a summary rather than
+// a second copy of the list - and it counts against the rows that apply at the
+// level on screen, which is the number that answers "why is that toggle doing
+// nothing".
+// A row's label, not the format's name for the layer id: the panel says
+// "macros" and the HUD should not say "macrobox" about the same row.
+const rowLabel = l => (ROWS.find(r => r.l === l) || {}).label || LAYER_NAMES[l];
+
 function layerLine(R) {
-  return TOGGLE_LAYERS.map((l, i) => {
-    const on = (R.layerMask >> l) & 1;
-    const a = R.translucent && R.layerAlpha[l] < 1 ? `(${R.layerAlpha[l].toFixed(2)})` : '';
-    return `${on ? '+' : '-'}${i + 1}:${LAYER_NAMES[l]}${a}`;
-  }).join(' ');
+  const live = ROWS.filter(r => appliesAt(r.l, R.kind));
+  const cats = live.filter(r => isCategory(r.l));
+  const vis = live.filter(r => (R.layerMask >> r.l) & 1).length;
+  const sel = cats.filter(r => (selectMask >> r.l) & 1).length;
+  const see = ROWS.filter(r => R.layerAlpha[r.l] < 1).length;
+  return `${vis}/${live.length} visible` +
+    (cats.length ? `   ${sel}/${cats.length} selectable` : '') +
+    (see ? `   ${see} see-through` : '') +
+    (soloLayer >= 0 ? `   SOLO ${rowLabel(soloLayer)}` : '') +
+    `   ${R.hasLayerIdentity ? 'process layers' : 'instance categories'} at z${useZ}` +
+    `   panel shift+l`;
 }
 
 // The counts that go on screen are what is drawn, not what happens to be
@@ -1147,10 +1218,17 @@ function countLine(R, budget) {
 // the diagnostics off must not turn the warnings off with them.
 function warnings(R) {
   const out = [];
+  // The mask is two halves and a level carries one of them, so this names which
+  // half is being ignored rather than saying only that something is.
   if (R.layerFilterIgnored) {
-    out.push(`layer filter ignored - z${useZ} ${KIND_NAME[R.kind]} has no layer identity: ` +
-      `${R.kind === 1 ? 'merged density, macros and the power grid' : 'one box per placement'}, ` +
-      `not process layers.   ] steps to a level that has them.`);
+    out.push(R.hasLayerIdentity
+      ? `instance-category filters are not applied at z${useZ} deep - a deep tile draws ` +
+        `process layers, and cells, macros and the power grid are what the coarser ` +
+        `levels draw instead.   [ steps out to a level that has them.`
+      : `process-layer filters are not applied at z${useZ} ${KIND_NAME[R.kind]} - it carries ` +
+        `${R.kind === 1 ? 'merged density, macros and the power grid' : 'one box per placement'}, ` +
+        `not process layers. The instance rows in the panel do apply here.   ` +
+        `] steps in to a level that has layers.`);
   }
   if (R.instancesDropped > 0) {
     out.push(`${R.instancesDropped} block instances not drawn - the tile origin table ` +
@@ -1187,6 +1265,7 @@ function drawHud(dt) {
   const avg = dts.reduce((a, b) => a + b, 0) / dts.length;
   const R = renderer;
   drawNotice(R);
+  layerPanel.update();
   if (hudMode === HUD_OFF) return;
 
   const s = store.stats;
@@ -1219,7 +1298,7 @@ update     last ${R.updateMs.toFixed(2)} ms (+${R.lastAdded}/-${R.lastRemoved} t
 frame      ${dt.toFixed(2)} ms  (submit ${submitMs.toFixed(2)} ms)   fps(60) ${fps}
 memory     masters ${mb(R.masters.bytes)} MB   gpu slots ${mb(R.poolBytes)} MB   tile table ${fmt(R.tileEntries)} entries
 zoom       ${cam.scale.toExponential(2)} px/nm   ${nmPerPx < 1 ? (nmPerPx * 1000).toFixed(1) + ' pm/px' : nmPerPx.toFixed(1) + ' nm/px'}${cam.atZoomFloor ? '   at the zoom floor' : ''}   origin ${R.originX.toFixed(0)},${R.originY.toFixed(0)}
-layers     ${layerLine(R)}   ${R.hasLayerIdentity ? (soloLayer >= 0 ? `SOLO ${LAYER_NAMES[soloLayer]}` : '(+ visible, - hidden)') : `not applied at z${useZ} ${KIND_NAME[R.kind]}`}
+layers     ${layerLine(R)}
 color      ${R.colorMode ? `by class: ${CLASS_LAYER_NAMES.join(' / ')}` : 'by layer'}   ${R.translucent ? 'translucent (layer passes)' : 'opaque'}   density ${(100 * R.densityRange[0]).toFixed(0)}-${(100 * R.densityRange[1]).toFixed(0)}%   tiles ${R.showTiles ? 'on' : 'off'}   blocks ${R.blockBounds ? 'on' : 'off'}   minPx ${R.minPx.toFixed(1)}   ring ${PREFETCH_RING}
 keys       ? or h for all of them, d for this panel
 ${status}`;

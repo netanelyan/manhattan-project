@@ -6,7 +6,7 @@
 <style>
   html, body { margin: 0; height: 100%; background: #0e0e10; overflow: hidden; }
   canvas { display: block; width: 100vw; height: 100vh; cursor: grab; }
-  #hud, #panel, #bar, #help, #notice {
+  #hud, #panel, #bar, #help, #notice, #layers {
     color: #9fd49f; font: 12px/1.55 Consolas, "DejaVu Sans Mono", monospace;
     background: rgba(0, 0, 0, .58); padding: 8px 12px; border: 1px solid #24301f;
   }
@@ -50,6 +50,46 @@
     color: #cfe9cf; font: inherit;
   }
   #bar .note { color: #6f9a6f; }
+  /* The layer panel. Top right, which is the only corner nothing else uses,
+     and the same green-on-black as everything else - no framework arrived to
+     draw a list of checkboxes. The two toggles and the colour chip are CSS
+     boxes rather than glyphs, so they are the same size in whatever monospace
+     font the machine actually resolves. */
+  #layers {
+    position: fixed; top: 10px; right: 10px;
+    display: none; padding: 6px 10px 8px; max-height: 84vh; overflow: auto;
+    user-select: none;
+  }
+  #layers.on { display: block; }
+  .lp-r {
+    display: grid; grid-template-columns: 13ch repeat(3, 3ch) 3ch;
+    align-items: center; height: 17px;
+  }
+  .lp-h { color: #6f9a6f; border-bottom: 1px solid #24301f; margin-bottom: 3px; }
+  .lp-g { color: #cfe9cf; margin-top: 5px; }
+  .lp-r:not(.lp-g):not(.lp-h) .lp-l { padding-left: 1.5ch; }
+  .lp-c { text-align: center; }
+  .lp-k { text-align: right; color: #6f9a6f; }
+  .lp-f { color: #6f9a6f; margin-top: 8px; max-width: 26ch; white-space: normal; }
+  /* Dimmed: the row's state is still yours to set, it simply has nothing to
+     act on at the level currently on screen. */
+  .lp-off .lp-l, .lp-off .lp-k { opacity: .45; }
+  .lp-off .bx { opacity: .45; }
+  .lp-r [data-a] { cursor: pointer; }
+  .lp-r [data-a]:hover .bx { border-color: #9fd49f; }
+  .lp-inert-s [data-a="s"] { cursor: default; }
+  .lp-inert-s [data-a="s"] .bx { border-style: dotted; opacity: .3; background: none; }
+  .lp-inert-s [data-a="s"]:hover .bx { border-color: #3f5a3f; }
+  .bx {
+    display: inline-block; width: 9px; height: 9px; vertical-align: middle;
+    border: 1px solid #3f5a3f; background: none;
+  }
+  .bx.on { background: #9fd49f; }
+  /* The colour chip carries its layer's colour at all times; "on" here means
+     the layer is see-through, so the chip is drawn washed out. */
+  .bx.sw { width: 16px; border-color: #24301f; }
+  .bx.sw.on { opacity: .3; }
+  .lp-off .bx.sw.on { opacity: .18; }
 </style>
 </head>
 <body>
@@ -58,6 +98,7 @@
 <div id="notice"></div>
 <div id="help"></div>
 <div id="panel"></div>
+<div id="layers"></div>
 <div id="bar"><label for="jump">go to x, y nm&nbsp;</label><input id="jump" spellcheck="false"
   placeholder="482100, 918400"><span class="note">&nbsp;&nbsp;enter, esc</span></div>
 <script>

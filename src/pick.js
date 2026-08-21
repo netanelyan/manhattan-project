@@ -16,7 +16,7 @@
 
 import {
   I_STRIDE, B_STRIDE, B_DENSITY, B_LAYER, B_FILL, TILE_KIND,
-  M_STRIDE, M_W, M_H, M_KLASS, LAYER_CELLBOX, key, overflowKey,
+  M_STRIDE, M_W, M_H, M_KLASS, LAYER_CELLBOX, CLASS_LAYER, key, overflowKey,
 } from './format.js';
 
 export const KLASS_NAME = ['cell', 'macro', 'power', 'filler'];
@@ -69,13 +69,27 @@ function scanBlocks(tile, bx, by) {
   return null;
 }
 
+// What a click can land on, by the panel's S column. A click resolves to a
+// placement or to a density block, and what either of those *is* - a cell, a
+// macro, the power grid - is an instance category, never a process layer. So
+// the selectable mask is read at the category bit, whatever level is on screen:
+// unchecking S on macros at a deep level skips the macro placement and the cell
+// underneath it answers, which is the whole point of the column.
+const selectable = (mask, layer) => ((mask >> layer) & 1) === 1;
+
 // (cx, cy) in chip nanometres. Returns null, a placement hit, or - at a far
 // level, where there are no placements to report - the density block, because
 // reporting a placement that is not there would be worse than reporting nothing.
+//
+// When everything under the point was excluded by the selectable mask, the miss
+// says so: `{ kind: 'filtered' }` with how many were skipped. A filter that
+// turns a hit into silence otherwise looks exactly like a broken viewer.
 export function pick(cx, cy, ctx) {
   const { chip, store, level, masters } = ctx;
+  const selectMask = ctx.selectMask === undefined ? 0xffff : ctx.selectMask;
   const z = level.z, S = level.tileSize, over = level.maxOverhang || 0;
   const far = level.kind === 'far';
+  let filtered = null;
 
   for (const inst of chip.visible({ minX: cx, minY: cy, maxX: cx, maxY: cy })) {
     const [bx, by] = inst.T.toBlock(cx, cy);
@@ -87,8 +101,13 @@ export function pick(cx, cy, ctx) {
     if (far) {
       const t = store.peek(key(z, tx, ty));
       const hit = t && t.kind === TILE_KIND.FAR ? scanBlocks(t, bx, by) : null;
-      if (hit) return { kind: 'block', inst, z, tx, ty, ...hit };
-      continue;
+      if (!hit) continue;
+      if (!selectable(selectMask, LAYER_CELLBOX)) {
+        filtered = filtered || { kind: 'filtered', count: 0, inst, z, tx, ty };
+        filtered.count++;
+        continue;
+      }
+      return { kind: 'block', inst, z, tx, ty, ...hit };
     }
 
     // The tile the point is in, plus any neighbour whose content can reach it,
@@ -105,10 +124,18 @@ export function pick(cx, cy, ctx) {
     if (ovf && ovf.inst) scanPlacements(ovf, bx, by, masters, found);
     if (!found.length) continue;
 
+    const ok = found.filter(f => selectable(selectMask, CLASS_LAYER[f.klass]));
+    if (!ok.length) {
+      filtered = filtered || { kind: 'filtered', count: 0, inst, z, tx, ty };
+      filtered.count += found.length;
+      continue;
+    }
+
     // Smallest wins: a cell inside a macro's footprint, or under a power strap,
-    // is the more specific answer to "what is this".
-    found.sort((a, b) => a.w * a.h - b.w * b.h);
-    return { kind: 'placement', inst, z, tx, ty, overlaps: found.length - 1, ...found[0] };
+    // is the more specific answer to "what is this". The S column is the
+    // deliberate version of the same decision, and it runs first.
+    ok.sort((a, b) => a.w * a.h - b.w * b.h);
+    return { kind: 'placement', inst, z, tx, ty, overlaps: ok.length - 1, ...ok[0] };
   }
-  return null;
+  return filtered;
 }

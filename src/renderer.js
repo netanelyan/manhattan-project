@@ -30,7 +30,8 @@
 
 import { RECT_TEX_WIDTH, TILE_KIND, I_STRIDE, M_STRIDE, M_KLASS, M_RECT_START,
          M_RECT_COUNT, B_STRIDE, B_LAYER, KLASS, CLASS_LAYER,
-         LAYER_CELLBOX, LAYER_MACROBOX, LAYER_POWERBOX } from './format.js';
+         LAYER_CELLBOX, LAYER_MACROBOX, LAYER_POWERBOX,
+         PROCESS_MASK, CATEGORY_MASK } from './format.js';
 import { SlotPool } from './pool.js';
 import { PLACEMENT_SLOT_I32, BLOCK_SLOT_I32, buildPlacementSlots, buildBlockSlots,
          fillFreePlacements, fillFreeBlocks, tileBuckets } from './slots.js';
@@ -56,9 +57,18 @@ const PALETTE = [
 const CLASS_NAMES = ['cell', 'macro', 'power', 'filler'];
 const PALETTE_SIZE = 20;
 
-// Keys 1-9 toggle these layers: the ones worth hiding while reading a layout.
-export const TOGGLE_LAYERS = [2, 3, 4, 5, 6, 7, 8, 9, 11];
 export const CLASS_LAYER_NAMES = CLASS_NAMES;
+
+// The same palette the shader gets, as CSS, so the layer panel's colour chip is
+// the colour on screen rather than a second table that can drift from it.
+export const LAYER_COLORS = PALETTE.slice(0, 16).map(
+  c => '#' + c.map(v => Math.round(v * 255).toString(16).padStart(2, '0')).join(''));
+
+// Alpha for the translucent path, per layer. Everything a process engineer
+// wants to see through is routing - metal over via over metal - so the lower
+// layers stay nearly opaque and the cell still reads as a cell. A layer at 1.0
+// has nothing to see through: the panel's C column leaves it alone.
+export const ALPHA_PRESET = [1, 1, 0.85, 0.85, 0.8, 0.55, 0.6, 0.5, 0.45, 0.7, 0.9, 0.5, 1, 1, 1, 1];
 
 // Rectangles per master per abstract layer, counted once from masters.bin. It
 // is what turns a resident master reference count into "how many rectangles
@@ -435,8 +445,10 @@ export class Renderer {
     this.layerMask = 0xffff;
     // Per-layer alpha. All 1.0 is the opaque path, which is the fast one; any
     // value below 1 switches drawing to ordered per-layer passes (see draw).
+    // Which path is taken is read off the array rather than tracked beside it,
+    // so setting one layer's alpha from the panel and setting every layer's
+    // from `v` cannot disagree about whether the viewer is translucent.
     this.layerAlpha = new Float32Array(16).fill(1);
-    this.translucent = false;
     this.densityRange = [0, 1];
     this.blockSize = 0;
     this.blockBounds = false;
@@ -476,20 +488,42 @@ export class Renderer {
 
   // ------------------------------------------------------- layer identity
   //
-  // Only deep tiles carry process layers. Mid tiles are one box per placement
-  // and far tiles are merged density, macros and power: three abstract layers
-  // that say what a thing is, not which mask it is printed on. So "show me
-  // metal1" has no referent there, and applying the mask anyway means a layer
-  // key blanks the screen and calls it a filter.
+  // The mask is two halves and a level carries exactly one of them. Only deep
+  // tiles carry process layers; mid tiles are one box per placement and far
+  // tiles are merged density, macros and power - the three instance categories,
+  // which say what a thing is, not which mask it is printed on. So "show me
+  // metal1" has no referent at a far level, and "show me macros" has none at a
+  // deep one.
   //
-  // The filter is ignored at those levels rather than obeyed into an empty
-  // frame, and `layerFilterIgnored` is what puts that on screen. The
-  // alternative - forcing a level that has layers when someone presses a layer
-  // key - would move the camera in response to a display control, which is
+  // The half that has no referent is forced on rather than obeyed into an empty
+  // frame, and `layerFilterIgnored` is what puts that on screen. It used to be
+  // the whole mask that was discarded above the deep levels, which meant the
+  // three category bits - the only layer identity a far tile has - could not be
+  // filtered at all, at any zoom. Splitting the mask is what makes the instance
+  // rows in the layer panel real controls rather than decoration.
+  //
+  // The alternative - forcing a level that has the layer when someone presses
+  // its key - would move the camera in response to a display control, which is
   // worse than saying no.
   get hasLayerIdentity() { return this.kind === TILE_KIND.DEEP; }
-  get effectiveMask() { return this.hasLayerIdentity ? this.layerMask : 0xffff; }
-  get layerFilterIgnored() { return !this.hasLayerIdentity && this.layerMask !== 0xffff; }
+  get liveMask() { return this.hasLayerIdentity ? PROCESS_MASK : CATEGORY_MASK; }
+  // The other half, named rather than derived as ~live: bit 15 is not a layer,
+  // and a mask that forces it on would have "the filter is being ignored" fire
+  // on every solo, which sets the other half and nothing above it.
+  get deadMask() { return this.hasLayerIdentity ? CATEGORY_MASK : PROCESS_MASK; }
+  get effectiveMask() { return this.layerMask | this.deadMask; }
+  get layerFilterIgnored() {
+    const dead = this.deadMask;
+    return (this.layerMask & dead) !== dead;
+  }
+
+  // Any layer below opaque puts drawing on the ordered per-layer path. Derived
+  // rather than stored: the panel sets one layer, `v` sets them all, and this
+  // is the one place that decides what that adds up to.
+  get translucent() {
+    for (let i = 0; i < 16; i++) if (this.layerAlpha[i] < 1) return true;
+    return false;
+  }
 
   // What is actually drawn, after the layer mask, not what happens to be
   // resident. The two differ by everything a filter removes, and a rectangle

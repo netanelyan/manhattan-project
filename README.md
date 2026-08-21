@@ -36,6 +36,15 @@ decisions this project rests on, assuming zero semiconductor background.
 | **scale tested at** | a 50M-placement block, 70 instances - 3.5 billion placements at chip level. Written out it is 1,185 MB in 62 s; with deep tiles produced on demand it is 233 MB in 15 s, and a produced tile is byte-identical to a written one |
 | **default dev design** | 5M placements, 117 MB, 4.5 s to generate |
 
+One number from somewhere else, for scale, and it is an observation rather than
+a measurement taken here: the status bar of Ansys RedHawk-SC - the tool the
+target users actually have open - was seen reading `Mem: 9.0GB` and
+`Refresh Time: 0.05s`. Nine gigabytes resident is a different architecture from
+one that streams tiles against a 64 MB cache, and it is consistent with the slow
+load times reported for it. That it puts a refresh time on screen at all says
+the number is one those users watch, which is the same reason the HUD here
+carries frame and update timings.
+
 ## Running it
 
 No dependencies, no build step. Node for the generator, a browser for the viewer.
@@ -88,13 +97,14 @@ disappear when the HUD does:
 | | `f` | fit the die |
 | | `g` | go to an `x, y` coordinate in nm |
 | | click | identify what is under the cursor |
-| | `esc` | dismiss the panel or the coordinate box |
+| | `esc` | dismiss the identify readout or the coordinate box |
 | level | `l` | automatic / manual LOD level |
 | | `[` `]` | force the level down / up (switches to manual) |
-| layers | `1`-`9` | toggle a layer |
-| | `shift`+`1`-`9` | solo a layer, hide the rest |
+| layers | `shift`+`l` | the layer panel |
+| | `1`-`9` `0` | toggle a layer, reading down the panel |
+| | `shift`+`1`-`9` | solo a layer, hide the rest of its half of the stack |
 | | `a` | all layers on / off |
-| | `v` | per-layer alpha, see through the stack |
+| | `v` | see through every layer that has a preset; the panel does one at a time |
 | display | `d` | HUD: full / one line / off |
 | | `?` `h` | the key list |
 | | `c` | colour by layer or by cell class |
@@ -104,13 +114,46 @@ disappear when the HUD does:
 | | `r` | reset the worst-update timer |
 | | `-` `=` | halve / double the tile cache budget |
 
-Layer filters apply where layers exist. A deep tile carries real process layers;
-mid and far tiles carry three abstract ones - one box per placement, or merged
-density, macros and the power grid - which say what a thing is, not which mask
-it is printed on. So a layer key has no referent there. The filter is ignored
-rather than obeyed into an empty frame, and the viewer says so on screen instead
-of leaving you to work out why `shift`+`5` blanked the die. `]` steps to a level
-that does have layers.
+## The layer panel
+
+Keys were the whole layer interface, and a key you have to remember is a key
+nobody presses. So the layers now have a panel, top right and on by default -
+grouped rows, a parent toggle per group, and three columns. `shift`+`l` puts it
+away again.
+
+| | |
+|---|---|
+| **V** | visible |
+| **S** | selectable: whether a click can land on it. Showing a macro and letting it swallow every click on the cells under it are different questions |
+| **C** | the layer's colour, and clicking it makes that one layer see-through. `v` is the same thing for all of them at once |
+
+The rows are one list, and it holds both kinds of thing the layer id space
+carries: the **process layers** a deep tile is made of - metal2, poly, contact -
+and the three **instance categories** a mid or far tile is made of - cells,
+macros, the power grid. So "what kind of thing" and "which mask is it printed
+on" share one control surface instead of being a layer key in one place and a
+colour mode in another.
+
+A level carries one half of that list or the other, never both, and the rows
+that have no referent at the level on screen are **dimmed rather than removed** -
+the state is still yours to set, and it applies the moment you zoom to where it
+means something. That is the per-row version of a message the viewer used to
+have to put in the corner. The half a level does not carry is left fully on
+rather than obeyed into an empty frame; a solo stays inside its own half for the
+same reason.
+
+Hiding all three instance rows at the chip view does now blank the screen,
+because there it is the whole of what is drawn. That is the filter working.
+
+**S is inert on the twelve process rows**, at every level, and shown as inert
+rather than as a control that does nothing: a click identifies a placement, never
+one of its rectangles, so there is no such thing as picking metal2.
+
+The model is taken from RedHawk-SC's layer panel, which is what these users have
+open all day - grouped rows with parent toggles, V and S as separate columns, and
+instance categories listed alongside physical layers. Theirs has a fourth column,
+M, whose meaning is not known here; `COLUMNS` in `src/panel.js` is where it goes
+when it is.
 
 ## Lazy tiles
 
@@ -201,9 +244,11 @@ pan - and loading it restores exactly what was on screen:
 | `view=x,y,scale` | camera centre in nm, and device pixels per nm |
 | `z=N&auto=0` | a level held by hand; absent means the level follows the zoom |
 | `mask=0x1f4` | which layers are visible |
+| `sel=0xcfff` | which layers a click can land on |
 | `solo=8` | soloed layer, with `mask` carrying what to return to |
 | `color=1` | colour by cell class rather than by layer |
-| `alpha=1` | per-layer alpha |
+| `alpha=0x80` | which layers are see-through (`alpha=1`, from older links, means all of them) |
+| `panel=0` | the layer panel put away |
 | `hud=line` `hud=off` | how much of the HUD is showing |
 | `pick=x,y` | the selected placement, so "come look at this" means *this* |
 
@@ -261,6 +306,7 @@ are in [docs/tile-format.md](docs/tile-format.md).
 | `tools/bench.js` | times the staging rebuild on real tiles, outside the browser |
 | `tools/serve.js` | static file server, core Node only |
 | `src/` | the viewer: plain ES modules, WebGL2, no framework |
+| `src/panel.js` | the layer panel: the row model, and what a row means at each level |
 | `src/slots.js` | the hot path: one tile to its GPU slot records |
 | `src/lod.js` | switch points from zoom, solved per design, chip and canvas |
 | `src/chip.js` | block instances and the block-to-chip transform |
@@ -319,10 +365,11 @@ rather than optimisations.
 
 [Tile format](docs/tile-format.md) - byte layout of `masters.bin` and the tile
 pyramid, and why the viewer parses nothing at runtime. Its **Known gaps**
-section is what the format cannot answer: no names and therefore no search, a
-class split the layer id space has no room for, a filler channel the synthetic
-data barely exercises, and cell internals at deep zoom that a real LEF does not
-have.
+section is what the format cannot answer: no names and therefore no search, one
+undifferentiated power layer where a real design has named rails, a class split
+the layer id space has no room for, a stack three metals wide that cannot widen
+without re-cutting the depth key, a filler channel the synthetic data barely
+exercises, and cell internals at deep zoom that a real LEF does not have.
 
 ## Where it is going
 

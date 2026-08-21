@@ -33,6 +33,13 @@ export const B_DENSITY = 4, B_LAYER = 5, B_FILL = 6, B_SPARE = 7;
 
 // Abstract layers used by mid and far tiles, and by class colouring.
 export const LAYER_CELLBOX = 12, LAYER_MACROBOX = 13, LAYER_POWERBOX = 14;
+// The layer id space is two halves, and which half a tile carries is decided by
+// its kind. 0-11 are process layers and appear only in deep tiles; 12-14 are
+// the instance categories and appear only in mid and far tiles. A filter over
+// the half a level does not carry has no referent there, which is why the two
+// are named rather than left as a range someone has to remember.
+export const PROCESS_MASK = 0x0fff;
+export const CATEGORY_MASK = 0x7000;
 // Class -> abstract layer, for the depth key when colouring by class. Filler
 // shares the cell layer: it sits where cells sit, it is only coloured apart.
 export const CLASS_LAYER = [LAYER_CELLBOX, LAYER_MACROBOX, LAYER_POWERBOX, LAYER_CELLBOX];

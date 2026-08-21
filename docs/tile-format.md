@@ -1092,6 +1092,30 @@ Identity in practice is position: two cells cannot occupy the same origin, so
 `(block instance, x, y)` names a placement exactly, and that is what a shared
 link carries.
 
+### What a click is allowed to land on
+
+More than one thing can be under a point — a cell inside a macro's footprint, a
+cell under a power strap — and the scan used to break the tie by taking the
+smallest hit, on the grounds that the more specific answer is the one someone
+wants. It usually is. It is also a guess, and it is the wrong one whenever the
+thing you are trying to reach is the large one.
+
+So the tie has a control in front of it: the layer panel's **S** column is a
+mask, `pick()` drops every candidate whose category bit is clear, and the
+smallest-hit rule runs on what is left. Turning S off for macros makes a click
+inside a macro's footprint report the cell underneath it, which is the case the
+column exists for.
+
+The mask is read at the **category** bit — `CLASS_LAYER[klass]`, one of
+cellbox, macrobox, powerbox — whatever level is on screen, because that is what
+a click resolves to at every level. A deep tile's process layers are not part of
+this: a click identifies a placement, never one of its rectangles, so there is
+no such thing as picking metal2.
+
+When the mask excludes everything under the point, the readout says so and how
+many were skipped. A filter that turns a hit into silence otherwise looks
+exactly like a viewer that has stopped working.
+
 ### What names would cost
 
 Worth writing down, because the answer is not symmetric:
@@ -1124,16 +1148,67 @@ being shown.
 
 | control | key | mechanism |
 |---|---|---|
-| visibility | `1`-`9` | `u_layerMask`, one bit per layer id. A hidden layer's vertices collapse to a degenerate position in the vertex shader, so it costs no rasterisation |
-| solo | `shift`+`1`-`9` | the mask, set to one bit. Repeating it restores the mask that was in force before, not "everything" |
+| visibility | `1`-`9` `0` | `u_layerMask`, one bit per layer id. A hidden layer's vertices collapse to a degenerate position in the vertex shader, so it costs no rasterisation |
+| selectability | — | not a uniform: the mask `pick()` filters candidates by, before the smallest-hit tiebreak. See "Identity, and what the format cannot answer" |
+| solo | `shift`+`1`-`9` | the mask, set to one bit plus the whole of the other half (below). Repeating it restores the mask that was in force before, not "everything" |
 | all on / off | `a` | the mask, set to `0xffff` or `0` |
-| per-layer alpha | `v` | `u_layerAlpha[16]`, and the ordered per-layer pass described under "Rendering is opaque-only" |
+| per-layer alpha | `v`, or the panel's C column | `u_layerAlpha[16]`, and the ordered per-layer pass described under "Rendering is opaque-only". Whether the translucent path runs at all is read off the array, not tracked beside it |
 | colour by layer / class | `c` | `u_colorMode`; the palette index is a varying, separate from the depth key |
 
 Hiding a layer in the vertex shader rather than discarding fragments is
 deliberate: a discarded fragment has already cost a rasterised pixel, while a
 collapsed vertex costs nothing downstream at all. The visible result is the
 same.
+
+### The mask is two halves, and a level carries one of them
+
+The 16 layer ids are not one space. Ids **0-11 are process layers** and appear
+only in deep tiles; ids **12-14 are the instance categories** — cellbox,
+macrobox, powerbox — and appear only in mid and far tiles. `PROCESS_MASK` and
+`CATEGORY_MASK` in `src/format.js` name the two, and the renderer's
+`effectiveMask` is the user's mask with the half the level does not carry forced
+on:
+
+```
+effectiveMask = layerMask | deadMask     // deadMask is CATEGORY at deep, PROCESS above it
+```
+
+Forcing rather than obeying is the point. "Show me metal1" has no referent at a
+far level and "show me macros" has none at a deep one, and a filter that is
+obeyed into an empty frame is a layer key that blanks the screen and calls
+itself a filter. `layerFilterIgnored` puts which half is being ignored on
+screen, and the layer panel dims the rows it applies to.
+
+The whole mask used to be discarded above the deep levels, on the grounds that
+those levels have "no layer identity". They do — three ids of it — and the
+consequence was that macros and the power grid could not be filtered at any
+zoom, which is exactly what someone at the chip view wants to do first. Splitting
+the mask is what makes the panel's instance rows real controls.
+
+A **solo** stays inside its own half for the same reason: soloing metal2 says
+nothing about whether macros should be drawn at a far level, and reading it as
+"hide those too" would blank every level with no metal2 to show.
+
+### The layer panel
+
+`src/panel.js` is the row model and `#layers` in `src/index.html` is its styling;
+between them there is no framework and no dependency. A row is one layer id, so
+a row is one palette entry, one mask bit and one colour chip. Groups carry a
+parent toggle, which is a convenience at three metals and the only usable form
+at the ten a real stack has.
+
+Three columns, V, S and C. V and S are the two axes the reference panel
+(RedHawk-SC) separates and this viewer did not; C is the layer's colour, and
+clicking it is the per-layer half of an alpha control that until then could only
+be set for every layer at once. Their panel has a fourth column, M, whose
+meaning is not known here — when it is, it is one more entry in `COLUMNS` and
+one more branch in `_get`/`_set`.
+
+**S has a referent only where a click can resolve to it.** A click resolves to a
+placement or to a density block, and what either of those *is* — a cell, a
+macro, the power grid — is an instance category, never a mask. So the column is
+live on the three instance rows and inert on the twelve process rows, at every
+level, rather than being a control that silently does nothing.
 
 ### Colour by class
 
@@ -1239,6 +1314,55 @@ trade on made-up numbers.
 Identity in practice is position: two cells cannot occupy the same origin, so
 `(block instance, x, y)` names a placement exactly, and that is what a shared
 link carries.
+
+### One undifferentiated power layer, and no named nets
+
+The same gap as search, one level up, and it is listed separately because the
+decision it is waiting on has to cover both at once.
+
+The format carries **one** power layer at deep zoom (`L.PWR`, id 11) and **one**
+power category above it (`powerbox`, id 14). Every strap in the design draws on
+them. A real design has power *domains*: RedHawk-SC's layer panel lists `VDD`,
+`VSS`, and then a long tail of named rails — `PCIE_UTIL_VPH_X4_1`,
+`PCIE_UTIL_VP_X1_0`, and so on — each individually visible or hidden, because
+which rail a strap belongs to is the question being asked. Power domains are
+first-class entities there and they are one undifferentiated layer here.
+
+The block is naming, exactly as it is for search. A strap is a placement, a
+placement is `(x, y, master | orient << 16)`, and there is nowhere in it for
+`VDD` any more than there is for `DFFQX1_A`. Splitting the layer id would not
+help and could not: the id space is full at 16 (see "Colour by class"), and a
+design with forty rails needs forty names, not forty layers.
+
+So when the naming decision is taken it has to name **three** things, not two:
+
+| | |
+|---|---|
+| masters | a cell type — `~60 KB` for 4,634, resident forever |
+| instances | a placement's own name — the expensive one, per-tile side file |
+| **nets** | which rail a strap belongs to. Small — a design has tens of power nets, not millions — but it needs a `u16` net id on the placement record or a per-tile side list, and that is the same format decision the other two make |
+
+Deciding instance names first and nets later would settle the record layout
+without the case that most wants a field in it. **Blocked on reading a real
+LEF/DEF**, with the rest of naming; see the roadmap.
+
+### The layer stack is three metals wide, and cannot widen without a re-cut
+
+`tools/layout.js` emits twelve process layers, of which three are metal and two
+are via. A real stack is ten and ten, and RedHawk-SC's panel lists `M0` through
+`M9` beside `VIA0` through `VIA9`.
+
+Nothing in the *viewer* cares. The layer panel is built from a table of rows and
+groups, the palette is indexed by layer id, and the parent toggles exist
+precisely because ten metals is where a flat list stops being usable. Widening
+the generator is a bigger master library and more `pushRect` calls.
+
+What stops it is the **layer id space, which is full at 16**, and the depth key
+`1 - layer/16` cut against it. Ten metals plus ten vias plus device, pin, macro
+and outline is past 16 before the three instance categories are counted at all.
+Widening means re-cutting the depth key to more bits — mechanical, and it
+touches the vertex shader, the palette, the mask, and the two half-masks the
+panel is built on. Worth doing against a real stack, not against a guess at one.
 
 ### Colour by class is cell/macro/power/filler, not combinational/sequential
 
@@ -1473,7 +1597,11 @@ per-level quantum in the contract, so it is not done.
 | jump to coordinate | done - chip coordinates, block instance resolved |
 | shareable view URL | done - position, scale, level, layers, colour, solo, selection |
 | instance and master names | not in the format, see Known gaps |
-| layer visibility, solo, per-layer alpha | done — alpha via ordered per-layer passes |
+| named power nets, power domains | not in the format — blocked with names, and to be decided with them, see Known gaps |
+| layer visibility, solo, per-layer alpha | done — alpha via ordered per-layer passes, per layer or all at once |
+| selectable as an axis separate from visible | done — the panel's S column, read at the category bit in `pick()` |
+| the layer panel | done — grouped rows with parent toggles, process layers and instance categories in one list |
+| a stack wider than three metals | not in the generator, and the layer id space is full at 16, see Known gaps |
 | colour by cell class | done — cell / macro / power / filler |
 | combinational vs sequential class | not in the data model, see Known gaps |
 | chip-level merged representation | not needed yet — the block's coarsest level serves the chip view; below one tile per block would need it |
